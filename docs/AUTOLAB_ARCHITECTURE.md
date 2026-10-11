@@ -7,12 +7,16 @@
 
 ## 一、先说清楚：它现在持久化在哪（事实，不是印象）
 
-| 内容 | 位置 | 换文件夹 | 换电脑 |
+| 内容 | 位置 | 在 git 里？ | 换电脑 |
 |---|---|---|---|
-| 工具 / 测试 / CLAUDE.md / hook | **工程仓库**（跟着工程走） | ❌ 不带过去 | ❌ |
-| 能力进度 / 学习 / 测试契约 / 决策 | `~/embedded-ai-journey/AUTOLAB_*.md` | ✅ 带 | 手动拷 |
-| 流程定义（技能） | `~/.claude/skills/ai-embedded-autolab` | ✅ 带 | 手动拷 |
-| AI 的"项目记忆" | `~/.claude/projects/<工程路径>/memory/` | ❌ **按工程路径隔离** | ❌ |
+| 工具 / 测试 / CLAUDE.md / hook | **工程仓库** | ✅ | `git clone` 该工程 |
+| **规则**（skill）+ **骨架** + **适配器** | `~/embedded-ai-journey/`（**平台仓库**） | ✅ | `git clone` + `install.sh` |
+| 能力进度 / 学习 / 测试契约 / 决策 | 同平台仓库根 `AUTOLAB_*.md` | ✅ | 同上一行 |
+| `~/.claude/skills/ai-embedded-autolab/` | **派生副本**（Claude Code 只从这加载） | ❌ | `install.sh` 自动同步 |
+| AI 的"项目记忆" | `~/.claude/projects/<工程路径>/memory/` | ❌ 按路径隔离 | ❌ **不要依赖它** |
+
+**2026-10-11 已做的改造**：原本"规则"和"状态"都躺在 `~/.claude/` 里、**不在版本控制中**，
+换机就断。现在整个 `~/embedded-ai-journey/` 成了一个 Git 仓库 —— 平台本身可以 clone。
 
 **两个必须知道的事实：**
 
@@ -123,37 +127,38 @@
 
 ---
 
-## 六、建议的目录结构
+## 六、目录结构（**已落地，2026-10-11**）
+
+`~/embedded-ai-journey/` 现在已经**是一个 Git 仓库**，它就是"平台"本身：
 
 ```
-~/embedded-ai-journey/
-├── AUTOLAB_PROGRESS.md          # 能力进度（跨工程）
-├── AUTOLAB_LEARNING.md          # 学习记录（跨工程）
-├── AUTOLAB_TESTS.md             # 测试契约（跨工程）
-├── AUTOLAB_DECISIONS.md         # 工程决策（跨工程）
-├── AUTOLAB_ARCHITECTURE.md      # ← 本文件：方法本身
-├── skeleton/                    # ★ 通用骨架（拷贝进新工程）
-│   ├── tools/serial_tool.py     # 通用：串口激励+观测
-│   ├── tools/hil.py             # 通用：编排 + 取证 + 报告 + 停止条件
-│   ├── tools/hooks/pre-commit   # 通用：提交前自动跑无板层
-│   ├── pytest.ini               # 通用：testpaths + 分层标记
-│   ├── requirements.txt         # 通用：pip 依赖
-│   └── CLAUDE.md.template       # 模板：坑要各工程自己填
-└── adapters/                    # ★ 按"芯片家族"存适配器与坑
-    ├── stm32-keil-ac5/          #   本工程这一套
-    │   ├── build.py             #     Keil 四判据（退出码/日志/编译动作/产物时间戳）
-    │   ├── flash.sh             #     uVision.com -f
-    │   ├── debug_probe.py       #     pyocd 封装
-    │   ├── check_ioc.py         #     CubeMX .ioc ↔ 代码
-    │   └── PITFALLS.md          #     这个家族的坑（8MHz 晶振、GBK、CubeMX 覆盖…）
-    ├── gd32/                    #   兆易等 ARM Cortex-M 国产片（可复用大部分）
-    ├── riscv-vendor/            #   RISC-V 家族（适配器几乎要重写）
-    └── ...
+embedded-ai-journey/            ← 平台仓库（新机器 git clone 这一份）
+├── README.md                   ← 门面：三种用法（换机器 / 换工程 / 换芯片）
+├── install.sh                  ← 新机器一键：装 skill + pip 依赖 + 提示还需人工装的
+├── skills/ai-embedded-autolab/ ← 【规则】skill 的受版本控制副本
+├── skeleton/                   ← 【骨架】与芯片无关
+│   ├── tools/  serial_tool.py  hil.py  preflight.py
+│   ├── hooks/pre-commit
+│   ├── tests/  test_host.py + host/test_ringbuf.c
+│   └── pytest.ini  requirements.txt
+├── adapters/stm32-keil-ac5/    ← 【适配器】本家族（含 PITFALLS.md）
+├── docs/AUTOLAB_ARCHITECTURE.md← 【方法】本文件
+└── AUTOLAB_*.md                ← 【状态】能力进度 / 学习 / 测试契约 / 决策
 ```
 
-**新工程 = 拷 `skeleton/` + 挑一个 `adapters/<family>/` + 填 `CLAUDE.md` 的坑。**
+**两个必须知道的操作事实：**
 
----
+1. **`AUTOLAB_*.md` 必须留在仓库根** —— skill 的 `SKILL.md` 写死了这个路径
+   （`~/embedded-ai-journey/AUTOLAB_PROGRESS.md`）。要改结构，得同时改 skill。
+2. **`~/.claude/skills/` 下那份是派生副本** —— Claude Code 只从那里加载 skill。
+   改 skill 的正确姿势：**改仓库副本 → 跑 `install.sh` 同步**。
+   直接改已安装的那份，换电脑就丢了。
+
+**新工程 = 拷 `skeleton/` + 挑一个 `adapters/<家族>/` + 填工程自己的 `CLAUDE.md`
++（关键，别省）重新标定所有判据。**
+
+> 首次落地时实测出的一个坑：`requirements.txt` 里写中文注释会让 `pip install -r`
+> **直接崩**（pip 按本机编码 GBK 解码该文件）。加 `# -*- coding: utf-8 -*-` 声明解决。
 
 ## 七、规则：每踩一个新坑，回写到哪里
 
