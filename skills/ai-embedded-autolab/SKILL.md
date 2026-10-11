@@ -287,3 +287,26 @@ Impact:
 - 把未执行的测试写成“通过”。
 - 用复杂 Agent 架构掩盖缺少稳定脚本的问题。
 - 因用户着急而跳过阶段验收。
+
+---
+
+# 附：这个 Skill 的「平台化」说明
+
+本 Skill 的**真实来源**是一个 Git 仓库（即 `~/embedded-ai-journey/`，本文件在其中的
+`skills/ai-embedded-autolab/`）。Claude Code 只从 `~/.claude/skills/` 加载，
+所以那份是**派生副本**。
+
+> **改这个 Skill 的正确做法**：改仓库里的副本 → 跑 `install.sh` 同步过去。
+> 直接改 `~/.claude/skills/` 下的文件 = 改动会在换电脑时丢失。
+
+同一仓库里还有：
+
+| 目录 | 内容 | 换芯片时 |
+|---|---|---|
+| `skeleton/` | 与芯片无关的通用件（串口观测、编排/取证/报告、环境自检、CI hook） | **不动** |
+| `adapters/<芯片家族>/` | 构建/烧录/调试/配置检查的适配器 + `PITFALLS.md` | **换一套** |
+| `docs/AUTOLAB_ARCHITECTURE.md` | 分层、迁移 recipe、经验回写规则 | 通用 |
+
+**坑往哪写**：这个家族的 → `adapters/<家族>/PITFALLS.md`；这个工程的 → 工程里的 `CLAUDE.md`；
+方法层面的 → `AUTOLAB_LEARNING.md`。
+判断标准：**"下一条用别的芯片的项目，还用得上吗？"**
