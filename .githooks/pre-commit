@@ -1,0 +1,72 @@
+#!/bin/sh
+# ============================================================
+# 平台仓库提交门禁（AI Coding Governance，层 1）
+# ============================================================
+# 只做**确定性**检查 —— 架构判断、代码审查、测试方案选择不在这里，
+# 那些由 Skill 指导完成（见 docs/engineering/）。
+#
+# 启用（可重复执行，幂等）：
+#     git -C <平台仓库> config core.hooksPath .githooks
+# 停用：
+#     git -C <平台仓库> config --unset core.hooksPath
+# 临时跳过某一次：
+#     git commit --no-verify
+#
+# 依赖：git + python。**不依赖任何芯片工具链**（Keil / pyocd / 串口一律不需要）。
+#
+# ⚠️ 关于"检查的是哪份内容"：
+#     治理检查器读的是**文件**。而"要提交的内容"在**暂存区(index)**，
+#     两者在"git add 之后又改了文件"时会不一致 —— 那时用工作区去证明暂存区是不成立的。
+#     所以本脚本先把**暂存区**导出到临时目录，再对导出的内容做检查。
+#     => 检查结果只代表**将要提交的那份内容**，与工作区是否干净无关。
+set -u
+
+REPO="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+    echo "[gov] 不在 git 仓库中，跳过" >&2; exit 0
+}
+cd "$REPO" || exit 1
+
+PY="${AUTOLAB_PYTHON:-python}"
+FAIL=0
+fail() { echo "[gov] ✗ $*"; FAIL=1; }
+
+echo "[gov] 平台提交门禁"
+
+# ---------- 门禁 1：暂存内容的空白错误 ----------
+# 尾随空格、制表符/空格混用、文件末尾多余空行等。零误报，且能防住
+# "改了一行却产生十几个无关 diff" 的情况。
+if ! git diff --cached --check; then
+    fail "暂存内容有空白错误（位置见上）—— 修掉后重新 git add"
+fi
+
+# ---------- 门禁 2：治理规则一致性（对**暂存内容**）----------
+TMP="$(mktemp -d 2>/dev/null)" || { fail "无法创建临时目录"; TMP=""; }
+[ -n "$TMP" ] && trap 'rm -rf "$TMP"' EXIT HUP INT TERM
+
+if [ -n "$TMP" ]; then
+    if git checkout-index -f -a --prefix="$TMP/" 2>/dev/null; then
+        mkdir -p "$TMP/tools"
+        if [ -f tools/check_governance.py ]; then
+            cp tools/check_governance.py "$TMP/tools/"
+            if ! ( cd "$TMP" && "$PY" tools/check_governance.py ); then
+                fail "治理规则不一致（见上）—— 修好后重新 git add 再提交"
+            fi
+        else
+            fail "找不到 tools/check_governance.py（治理检查器缺失）"
+        fi
+    else
+        fail "无法导出暂存内容（index 异常）"
+    fi
+fi
+
+# ---------- 结论 ----------
+if [ "$FAIL" -ne 0 ]; then
+    echo
+    echo "[gov] 提交已被拦截。"
+    echo "      · 规则全文：docs/engineering/（变更策略 / Git 安全 / C 规范 / Python 规范 / 测试放行）"
+    echo "      · 治理文档必须出现在本次提交里 —— 否则暂存区里的规则是不完整的"
+    echo "      · 确实要跳过这一次：git commit --no-verify"
+    exit 1
+fi
+echo "[gov] ✓ 通过"
+exit 0

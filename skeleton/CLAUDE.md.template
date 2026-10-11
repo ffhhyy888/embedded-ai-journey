@@ -1,0 +1,77 @@
+# CLAUDE.md — <工程名>
+
+> **用法**：把本文件复制成新工程的 `CLAUDE.md`，替换 `<...>` 占位符，
+> 然后**填第三节「本工程的坑」**（这部分每个工程都不一样，别人替不了）。
+>
+> ⚠️ **不要在本文件里复制平台规范全文**。规范只有一份，在上面的平台仓库里，
+> 本文件只做**引用 + 本工程特有信息**。
+
+---
+
+## 一、规范在哪（平台仓库，单一来源）
+
+平台仓库默认克隆在 `~/embedded-ai-journey/`（Windows: `C:\Users\HP\embedded-ai-journey\`；
+若路径不同，以本机实际为准）。
+
+| 主题 | 文件 |
+|---|---|
+| 变更范围 / 规模红线 | `~/embedded-ai-journey/docs/engineering/CHANGE_POLICY.md` |
+| Git 安全 / 回滚 / 禁止清单 | `~/embedded-ai-journey/docs/engineering/GIT_SAFETY.md` |
+| 嵌入式 C 规范 | `~/embedded-ai-journey/docs/engineering/EMBEDDED_C_STANDARD.md` |
+| Python 自动化规范 | `~/embedded-ai-journey/docs/engineering/PYTHON_AUTOMATION_STANDARD.md` |
+| 测试门禁与放行 | `~/embedded-ai-journey/docs/engineering/TEST_AND_RELEASE_POLICY.md` |
+| 本芯片家族的坑 | `~/embedded-ai-journey/adapters/<芯片家族>/PITFALLS.md` |
+
+**开工前先读**：`CHANGE_POLICY` + `GIT_SAFETY` + 对应家族的 `PITFALLS`。
+
+---
+
+## 二、本工程概况（填）
+
+- 路径：`<绝对路径>`
+- MCU / 板子：`<型号 / 板子>`
+- 工具链：`<编译器 / IDE / 版本>`
+- 芯片家族适配器：`<adapters/<家族>/ 或"本工程自带">`
+- 关键外设：`<UART / SPI / I2C / DMA / SDIO ...>`
+- 串口：`<COMx 或 /dev/ttyUSBx>`（可用环境变量 `AUTOLAB_PORT` 覆盖）
+
+### 命令（填）
+```bash
+python tools/preflight.py              # L0 环境自检
+python tools/build.py                  # L1 构建
+python -m pytest -m "not hardware" -q  # L2 无板测试
+python tools/hil.py                    # L3 真机轮次（⚠️ 会烧录，需授权）
+```
+
+---
+
+## 三、🔴 本工程的坑（**必填**，每个工程都不一样）
+
+> 判据：**"下一条用别的芯片的项目，还用得上吗？"**
+> 用得上 → 写进平台 `AUTOLAB_LEARNING.md`；用不上 → 写这里。
+
+1. `<例：本板晶振是 X MHz，不是生成器默认的 Y>`
+2. `<例：源文件是 GBK，必须用字节级替换改>`
+3. `<例：生成器重新生成会冲掉哪几处手改>`
+
+---
+
+## 四、硬约束速查（与平台一致，避免每次翻文档）
+
+- **先看再动**：`git status` / `git diff --stat` / `git log --oneline -3`
+- **未提交的修改是用户的**：不覆盖、不清理、不顺手提交
+- **禁止** `reset --hard` / `git clean` / `checkout .` / `force push` / 改写已推送历史
+- **未经授权不 commit / push**；每次改动要能说清**怎么回滚**
+- **最小合理差异**；超红线（文件数 > 计划×1.5、新增行 > 200、触及计划外目录）→ **暂停报告**
+- **烧录 / 擦除 / Option Bytes / 复位 / 占用串口 → 需人工授权**
+- **NOT RUN ≠ PASS**；判据必须**双向标定过**；失败留**指纹 + 版本 + 原始观测**
+- 🚫 绝不为了过门禁而删测试 / 放宽断言 / 吞异常 / 跳过检查
+
+---
+
+## 五、本工程的状态（填 / 随进展更新）
+
+- 当前阶段：`<...>`
+- 最近一次 L0–L2：`<日期 / 结果>`
+- 最近一次 L3：`<日期 / 结果 / 或 NOT RUN（原因）>`
+- 已知脆弱点：`<...>`

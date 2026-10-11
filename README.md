@@ -35,6 +35,9 @@ embedded-ai-journey/            ← 本仓库（平台）
 │   └── pytest.ini  requirements.txt
 ├── adapters/                   ← 【适配器】按芯片家族
 │   └── stm32-keil-ac5/         ← 本仓库目前有的一套（含 PITFALLS.md）
+├── CLAUDE.md                   ← 【入口】规则路由 + 硬约束速查（Claude Code 进来自动读）
+├── docs/engineering/           ← 【规范】5 份治理文档（单一来源）
+│     变更策略 / Git 安全 / 嵌入式 C / Python 自动化 / 测试放行
 ├── docs/AUTOLAB_ARCHITECTURE.md← 【方法】分层、迁移 recipe、经验分流规则
 ├── AUTOLAB_PROGRESS.md         ← 【状态】能力进度（⚠️ skill 依赖此固定路径）
 ├── AUTOLAB_LEARNING.md         ← 【状态】跨工程的学习记录
@@ -44,6 +47,49 @@ embedded-ai-journey/            ← 本仓库（平台）
 
 ⚠️ **`AUTOLAB_*.md` 必须在仓库根**：skill（`SKILL.md` 第 45 行起）写死了这个路径。
 想改结构，得同时改 skill。
+
+---
+
+## 工程治理规范（AI Coding Governance）
+
+平台不只提供工具，也提供**约束**：Claude Code 在任何工程里工作时，
+必须遵守 [`CLAUDE.md`](CLAUDE.md) 里指向的 5 份规范（变更范围 / Git 安全 /
+嵌入式 C / Python 自动化 / 测试门禁）。规范全文只有一份，在 `docs/engineering/`。
+
+**统一任务生命周期**：检查状态 → 制定计划 → 最小修改 → 自动检查 → 按需测试 →
+审查 diff → 报告风险（含回滚方法）。
+
+**硬约束速查**：
+- 未提交的修改是用户的 —— 不覆盖、不清理、不顺手提交
+- 禁止 `reset --hard` / `git clean` / `checkout .` / `force push` / 改写已推送历史
+- 未经授权不 commit / push
+- **NOT RUN ≠ PASS**；判据必须双向标定过
+- 烧录 / 擦除 / Option Bytes / 复位 / 占用串口 → 需人工授权
+
+### 启用平台提交门禁（新电脑克隆后做一次）
+
+平台自带一个**提交前门禁**（`.githooks/pre-commit`，只做确定性检查，
+**不依赖任何芯片工具链** —— 不需要 Keil / pyocd / 串口）：
+
+```bash
+git -C ~/embedded-ai-journey config core.hooksPath .githooks
+```
+
+它检查两件事：
+
+1. **暂存内容的空白错误** —— `git diff --cached --check`（尾随空格等，零误报）
+2. **治理规则一致性** —— 调 `tools/check_governance.py`
+
+> ⚠️ 第 2 项检查的是**暂存内容**：hook 先把 index 导出到临时目录再检查，
+> 所以"工作区正常但暂存内容不一致"的情况**也会被抓到** ——
+> 检查结果只代表**将要提交的那份**，与工作区是否干净无关。
+
+失败时**拦截提交**并给修复提示；临时跳过：`git commit --no-verify`；
+停用：`git config --unset core.hooksPath`。
+
+> **首次使用注意**：治理文档（`CLAUDE.md` / `docs/engineering/` 等）
+> 必须**已经进入暂存区**，否则门禁会报"规范文档缺失" —— 这是有意的：
+> 提交里不能缺规则。
 
 ---
 
