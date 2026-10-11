@@ -33,10 +33,13 @@ def build_and_run(src_name):
         return run.returncode, out
 
 
-pytestmark = pytest.mark.skipif(
-    subprocess.run(ZIG + ["version"], capture_output=True, timeout=60).returncode != 0,
-    reason="宿主机 C 编译器不可用（pip install ziglang）",
-)
+pytestmark = [
+    pytest.mark.nohardware,        # 分层：属于 CI 层1（不碰硬件）
+    pytest.mark.skipif(
+        subprocess.run(ZIG + ["version"], capture_output=True, timeout=60).returncode != 0,
+        reason="宿主机 C 编译器不可用（pip install ziglang）",
+    ),
+]
 
 
 def test_ringbuf_on_host():

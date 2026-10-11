@@ -60,8 +60,31 @@ def check_pip_deps():
 
 
 def check_toolchain():
+    """构建/调试工具链的检查**依赖适配器** —— 通用骨架里没有它们。
+
+    关键区分（不能混）：
+      · 找不到适配器模块 `build`     -> SKIP（骨架本来就不带芯片适配器）
+      · 适配器在、但它自己缺依赖     -> FAIL 并如实报错
+      · 适配器自己抛异常             -> FAIL 并如实报错
+    否则会把"适配器的真实故障"伪装成"没装适配器"，把人带偏。
+    """
     sys.path.insert(0, os.path.join(ROOT, "tools"))
-    import build as build_mod                     # 读它解析出来的路径，避免两处不一致
+    try:
+        import build as build_mod                 # 读它解析出来的路径，避免两处不一致
+    except ModuleNotFoundError as e:
+        if e.name == "build":
+            add("SKIP", "构建工具链", "未检测到适配器 tools/build.py",
+                "通用骨架不绑定具体芯片；拷入 adapters/<芯片家族>/ 后此项才有意义")
+            return
+        add("FAIL", "构建工具链",
+            f"适配器导入失败：缺模块 `{e.name}` —— 这是适配器自己的依赖没装，不是缺适配器",
+            f"python -m pip install {e.name}   （或按适配器 README 安装）")
+        return
+    except Exception as e:
+        add("FAIL", "构建工具链", f"适配器导入时抛异常：{type(e).__name__}: {e}",
+            "这是适配器自身的 bug，请修 tools/build.py（不是环境问题）")
+        return
+
     uv = str(build_mod.UVISION)
     if os.path.exists(uv):
         add("OK", "Keil uVision(.com)", uv)
@@ -145,7 +168,7 @@ def main():
     print("环境自检")
     print("=" * 72)
     for level, name, detail, fix in results:
-        mark = {"OK": "[ OK ]", "WARN": "[WARN]", "FAIL": "[MISS]"}[level]
+        mark = {"OK": "[ OK ]", "WARN": "[WARN]", "FAIL": "[MISS]", "SKIP": "[SKIP]"}[level]
         print(f"{mark} {name:<{width}} {detail}")
         if fix:
             print(f"       └─ 修复: {fix}")
@@ -155,6 +178,9 @@ def main():
         print(f"结论：{len(fails)} 项致命问题未解决 -> 上层工具会以各种奇怪的方式失败")
         return 1
     print("结论：关键项全部就绪")
+    skipped = [r[1] for r in results if r[0] == "SKIP"]
+    if skipped:
+        print(f"（跳过 {len(skipped)} 项：{', '.join(skipped)}）")
     if not a.with_hardware:
         print("（硬件未探测；要查板子/串口/调试器，加 --with-hardware）")
     return 0
