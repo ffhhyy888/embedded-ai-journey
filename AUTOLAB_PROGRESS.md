@@ -198,6 +198,26 @@ F:\stm32xiangmu\SDIO_test
  6 Simulation → 7 HIL → 8 CI/CD → 9 Hardware/EDA → 10 CC Engineering →
  11 Closed Loop → 12 Hardening`  **全部通过，且每一阶段都有真机证据。**
 
+## 🚀 平台化（2026-10-11，路线图之后的升级）
+
+**问题**：12 阶段都建在"这台电脑"上 —— **规则**（skill）和**状态**（AUTOLAB_*.md）
+都躺在 `~/.claude/` 与用户目录里，**都不在版本控制中**，换机即断。
+
+**改造**：把 `~/embedded-ai-journey/` 变成 **Git 仓库 = 平台本身**
+```
+skills/    ← 规则（skill 的受版本控制副本）
+skeleton/  ← 骨架（与芯片无关：串口观测/编排取证报告/环境自检/CI hook）
+adapters/  ← 适配器（按芯片家族；stm32-keil-ac5 已含 PITFALLS.md）
+docs/      ← 方法（AUTOLAB_ARCHITECTURE.md）
+AUTOLAB_*.md ← 状态（必须留根目录：skill 写死了该路径）
+README.md + install.sh
+```
+- 已在平台仓库提交 3 次（`58290e6` / `68d236f` / `8e59419`）
+- `install.sh` **实测通过**：把 skill 复制到 `~/.claude/skills/` 并同步验证一致
+- **实测抓到一个真 bug**：`requirements.txt` 里写中文注释会让 `pip install -r`
+  **直接崩**（pip 按本机编码 GBK 解码）→ 加 PEP-263 声明修复；
+  同一个 bug 在工程仓库里也存在，一并修了（`b35b9f2`）
+
 ## Next Micro Task
 - **没有下一阶段了** —— 剩下的是"可选深化"，按价值排序：
   1. **抽骨架**：把通用件抽到 `~/embedded-ai-journey/skeleton/`，
