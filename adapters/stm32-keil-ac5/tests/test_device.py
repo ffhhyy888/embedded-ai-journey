@@ -1,8 +1,10 @@
 """Stage 4 回归套件 —— 真机部分：串口链路。
 
-运行:  python -m pytest tests/ -v
-前置:  - 固件已烧录（须含 ESC 软复位命令）
-       - USB-TTL 接好；可用环境变量 AUTOLAB_PORT 覆盖端口（默认 COM9）
+运行:  python -m pytest tests/test_device.py -v **-m hardware**
+       （pytest.ini 默认排除 hardware —— 不加 -m hardware 会一个用例都不跑）
+前置:  - 固件已烧录（须含配置里约定的软复位命令）
+       - USB-TTL 接好；端口与启动标记**不在这里写死** —— 交给 tools/serial_tool.py
+         按 CLI > AUTOLAB_PORT > project.cfg > 内置默认 自行解析
 证据:  每次调用工具都会把原始输出落盘到 tests/artifacts/（失败后可直接翻看）
 
 设计说明:
@@ -21,7 +23,6 @@ import pytest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "serial_tool.py")
 ARTIFACTS = os.path.join(ROOT, "tests", "artifacts")
-PORT = os.environ.get("AUTOLAB_PORT", "COM9")
 
 # 这些用例要真机：CI 层1 用 -m "not hardware" 跳过它们
 pytestmark = pytest.mark.hardware
@@ -52,11 +53,12 @@ def run_tool(*args, timeout=60):
 # ------------------------------------------------------------------ 正常路径
 
 def test_soft_reset_smoke():
-    """软复位后必须收到启动标记 USh（U=时钟/UART、S=SDIO 初始化、h=进入主循环）。
+    """软复位后必须收到**本工程配置的**启动标记（project.cfg 的 [serial] boot_marker）。
 
-    这是**无需人工按键**的冒烟测试 —— 复位由串口 ESC 命令触发。
+    这里刻意不传 --expect / --port：交给 tools/serial_tool.py 解析，
+    免得把工程契约复制进测试里。这是**无需人工按键**的冒烟测试。
     """
-    rc, data = run_tool("--port", PORT, "--reset", "--expect", "USh", "--timeout", 8)
+    rc, data = run_tool("--reset", "--timeout", 8)
     assert rc == 0, f"软复位冒烟失败（退出码 {rc}）: {data}"
     assert data.get("result") == "PASS"
 
@@ -64,7 +66,7 @@ def test_soft_reset_smoke():
 def test_echo_roundtrip():
     """收发闭环：发出去什么，必须原样回来。"""
     payload = "hello 123"
-    rc, data = run_tool("--port", PORT, "--echo", payload, "--timeout", 5)
+    rc, data = run_tool("--echo", payload, "--timeout", 5)
     assert rc == 0, f"回显失败（退出码 {rc}）: {data}"
     assert data["recv"]["ascii"] == payload
 
@@ -73,7 +75,7 @@ def test_echo_roundtrip():
 
 def test_echo_single_byte():
     """边界：单字节也要能回（最容易暴露接收超时/首字节处理问题）。"""
-    rc, data = run_tool("--port", PORT, "--echo", "Z", "--timeout", 5)
+    rc, data = run_tool("--echo", "Z", "--timeout", 5)
     assert rc == 0, f"单字节回显失败（退出码 {rc}）: {data}"
 
 
@@ -85,7 +87,7 @@ def test_echo_long_payload():
     标记已删除。此用例现在必须**真通过**。
     """
     payload = ("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" * 4)[:128]
-    rc, data = run_tool("--port", PORT, "--echo", payload, "--timeout", 10)
+    rc, data = run_tool("--echo", payload, "--timeout", 10)
     assert rc == 0, f"长载荷回显失败（退出码 {rc}）: {data}"
     assert data["n_recv"] == data["n_sent"] == len(payload)
 
@@ -101,7 +103,7 @@ def test_echo_4k_burst():
     本用例锁住这个边界，防止以后回退。
     """
     payload = ("The quick brown fox jumps over the lazy dog. 0123456789 " * 100)[:4096]
-    rc, data = run_tool("--port", PORT, "--echo", payload, "--timeout", 20)
+    rc, data = run_tool("--echo", payload, "--timeout", 20)
     assert rc == 0, f"4KB 突发回显失败（退出码 {rc}）: {data}"
     assert data["n_recv"] == data["n_sent"] == len(payload)
 
@@ -110,7 +112,7 @@ def test_echo_4k_burst():
 
 def test_wrong_expect_must_fail():
     """异常：期望一个不可能出现的标记 -> 必须 FAIL 且退出码 **1**（被测不通过）。"""
-    rc, data = run_tool("--port", PORT, "--reset", "--expect", "ZZ",
+    rc, data = run_tool("--reset", "--expect", "ZZ",
                         "--timeout", 3, "--retries", 0)
     assert rc == 1, f"退出码应为 1（被测失败），实际 {rc}: {data}"
     assert data.get("result") == "FAIL"

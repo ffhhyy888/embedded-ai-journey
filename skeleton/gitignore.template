@@ -1,0 +1,124 @@
+# ============================================================================
+# .gitignore 模板 —— 拷成 <新工程>/.gitignore 后即可使用
+# ============================================================================
+
+
+# ---- A. 使用说明与注意事项 ----
+
+# 怎么用
+#   1) cp <平台仓库>/skeleton/gitignore.template <新工程>/.gitignore
+#   2) 把本文件里所有 <PROJECT_NAME> 替换成新工程名
+#      （= Keil 的 <OutputName>，也是 MDK-ARM 下那个输出目录的名字）
+#   3) 换芯片家族 / 换 IDE 时：只替换【E 节】，其余各节一般不用动
+#
+# 收录标准（一句话）
+#   删掉它以后，能不能靠工具重新生成？能 -> 不该进 Git；不能 -> 必须进 Git。
+#
+# ⚠️ 三条容易搞错的
+#   · 被忽略 ≠ 受保护：文件仍在磁盘上，换个规则或换个仓库就可能被提交。
+#     密钥的真正防线是「不要放进工作区」+ 提交前复核 `git diff --cached`。
+#   · 规则写宽了会误伤源码。E 节刻意用 <PROJECT_NAME> 占位而不是 MDK-ARM/*/：
+#     后者会把 MDK-ARM/DebugConfig/（调试配置，通常需要入库）与 MDK-ARM/RTE/
+#     一起忽略掉。
+#   · 本文件的注释必须【独占一行】：.gitignore 不支持"规则 + 行尾注释"，
+#     写在同一行上，注释会被当成规则本身的一部分。
+
+
+# ---- B. Python 产物 ----
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+
+# ---- C. 虚拟环境 ----
+venv/
+.venv/
+env/
+ENV/
+
+
+# ---- D. 平台运行产物（跑测试 / HIL 轮次时生成，属本机证据）----
+
+# hil.py 的失败取证轮次 runs/<时间戳>_FAIL/
+runs/
+
+# 真机用例每次调用落盘的原始输出
+tests/artifacts/
+
+# build.py 归档的构建日志
+tools/build_logs/
+
+
+# ---- E. 工具链产物：STM32 + Keil MDK-ARM ----
+# ⚠️ 【换芯片家族 / 换 IDE 时，整节替换成你的工具链的规则】
+
+# Keil 输出目录。目录名 = 工程名，所以用占位符而不是通配
+MDK-ARM/<PROJECT_NAME>/
+
+# 编译/链接中间产物与最终镜像
+*.o
+*.d
+*.crf
+*.dep
+*.lnp
+*.axf
+*.hex
+*.bin
+*.elf
+*.map
+*.sct
+*.lst
+
+# Keil 的列表页只生成在 MDK-ARM/ 下
+# （不收窄成裸 *.htm，免得把别处手写的 .htm 文档一起忽略）
+MDK-ARM/*.htm
+
+# 个人界面布局：换机器即失效，团队成员之间不必共享
+*.uvguix.*
+
+MDK-ARM/EventRecorderStub.scvd
+
+# ⚠️ 下面这些是【源文件 / 配置】，上面任何一条都不得匹配到它们。
+#    往 E 节加规则之前，先跑 `git check-ignore -v <文件>` 确认没误伤：
+#      MDK-ARM/startup_*.s    启动汇编，【是源码】；上面的 *.lst 只匹配它的列表输出
+#      *.uvprojx / *.uvoptx   Keil 工程与选项，必须入库
+#      *.ioc                  CubeMX 配置源，代码由它生成，必须入库
+#      <工程名>.c / .h        源码
+
+
+# ---- F. 日志 ----
+# 覆盖面刻意很宽：build_*.log、MDK-ARM/flash.log、MDK-ARM/_last_build.log 都在内。
+# ⚠️ 代价：**任何** .log 都进不了库。确实需要入库的日志请改用别的后缀
+#    （例如 .log.txt）—— 不要为了它收窄这一条，收窄更容易漏掉真正的产物日志。
+*.log
+
+
+# ---- G. 凭据 / 密钥 ----
+.env*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.ppk
+id_rsa*
+id_ed25519*
+
+
+# ---- H. 临时 / 备份 / 编辑器残留 ----
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+*.swp
+*.swo
+*~
+
+
+# ---- I. 操作系统杂项 ----
+Thumbs.db
+desktop.ini
+.DS_Store

@@ -129,6 +129,41 @@ cp -r ~/embedded-ai-journey/adapters/stm32-keil-ac5/* <新工程>/
 
 ---
 
+## 迁移注意事项
+
+### 新工程：两份模板要各自实例化一次
+
+```bash
+cp adapters/stm32-keil-ac5/project.cfg.example  <新工程>/tools/project.cfg
+cp skeleton/gitignore.template                  <新工程>/.gitignore
+```
+
+两份模板都是**必须先改再用**的：
+
+- `project.cfg` 里照抄参考值（工程名 / 编译动作阈值 / 内存预算 / 必需符号 / 串口）
+  会**直接判错** —— 那是 SDIO_test 的值，不是你的
+- `.gitignore` 里忘了替换 `<PROJECT_NAME>`，规则就匹配不到任何东西，
+  **Keil 的输出目录会进版本库**
+
+### 已有工程升级：`pytest.ini` 与 `hil.py` **必须同批**同步
+
+`pytest.ini` 的 `addopts` 默认排除 `hardware`（裸跑 `pytest` 不碰硬件）。
+若只同步它、不同步 `hil.py`，后者跑真机用例时会被全部 deselect →
+pytest 返回**退出码 5**（没跑任何用例）→ **HIL 被判 FAIL**。
+
+> **顺序：先 `hil.py`，后 `pytest.ini`；或者一次把两个都换掉。**
+> 只同步 `hil.py` 是安全的（多一个 `-m hardware` 无副作用）。
+
+### 串口参数只在 `project.cfg` 里定一次
+
+端口 / 波特率 / 启动标记 / 复位命令统一放工程的 `tools/project.cfg`；
+临时换端口用环境变量 `AUTOLAB_PORT` 覆盖即可。
+
+**不要在测试代码里再解析一遍端口** —— 那会变成第二份真相：配置改了却不生效，
+而且从现象上看不出来。（完整优先级见 `docs/AUTOLAB_ARCHITECTURE.md` 第二节。）
+
+---
+
 ## 坑往哪写（这条最容易忘）
 
 | 坑的类型 | 写到哪里 |

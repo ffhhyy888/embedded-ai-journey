@@ -52,6 +52,59 @@
 **生态越不成熟，骨架越重要** —— 因为适配器可能根本没有好用的现成工具，
 你只能靠"无板层"（构建本身 + 宿主机单元测试 + 静态契约）兜住大部分验证。
 
+### 配置从哪来（工程级 / 机器级，别混）
+
+| 放哪 | 装什么 | 换什么才改 |
+|---|---|---|
+| **工程的 `tools/project.cfg`**（工程级） | 工程名、构建/产物路径、编译动作阈值、内存预算与必需符号、串口参数、`.ioc` 文件名 | 换**工程** |
+| **环境变量 `AUTOLAB_*`**（机器级） | 工具链安装位置（`AUTOLAB_UVISION` / `AUTOLAB_FROMELF`）、各种超时、`AUTOLAB_PORT` | 换**电脑** |
+| **代码里的芯片族常量** | Flash 向量基址 `0x08000000`、SRAM 基址 `0x20000000` | 换**芯片家族** |
+
+**优先级（全平台统一，由 `project_config.resolve()` 一处实现）：**
+
+```
+CLI 参数  >  环境变量  >  tools/project.cfg  >  内置默认
+```
+
+逐项（谁认环境变量是有意设计的，不是遗漏）：
+
+| 键 | CLI | 环境变量 | project.cfg | 内置默认 |
+|---|---|---|---|---|
+| `serial.port` | `--port` | **`AUTOLAB_PORT`** | `[serial] port` | `COM9` |
+| `serial.baud` | `--baud` | ❌ 无 | `[serial] baud` | `115200` |
+| `serial.boot_marker` | `--expect` | ❌ 无 | `[serial] boot_marker` | `USh` |
+| `serial.reset_cmd_hex` | — | ❌ 无 | `[serial] reset_cmd_hex` | `1b` |
+
+> `baud` 刻意**不给**环境变量：端口常要临时换，波特率不该随手改。
+
+两个"别放错地方"：
+
+- **机器级路径不要进 `project.cfg`**。`fromelf` 装在哪是"这台电脑"的事，
+  不是"这个工程"的事 —— 写进 cfg 会让同一个工程在不同电脑上互相打架。
+- **芯片族常量也不进 `project.cfg`**。`0x08000000` / `0x20000000` 是 Cortex-M
+  的启动基址，换型号也不变 —— 按上面的分界线，它们属于**适配器**。
+  将来真要支持启动地址不同的芯片族，再考虑加 `[image] vector_base`。
+
+**配置缺失时的行为**：`build.py` / `flash.py` 这类"离开工程就没意义"的工具
+**直接报错并给修复提示**；`serial_tool.py` / `preflight.py` 这类**诊断工具**
+允许脱离工程使用，但会把每一处降级**逐条打出来**（`[WARN]`）。
+**降级允许，静默不允许。**
+
+### 测试分层与 CI
+
+真机用例标 `hardware`，其余标 `nohardware`。`skeleton/pytest.ini` 的 `addopts`
+**默认排除 `hardware`** —— 裸跑 `pytest` **不会碰板子/串口**。
+
+要跑真机必须显式：
+
+```bash
+pytest -m hardware
+```
+
+> ⚠️ **程序化调用同理**：`hil.py` 调 pytest 时带了 `-m hardware`。
+> 这两个文件**必须同批迁移** —— 只改 `pytest.ini` 会让 pytest 返回退出码 5
+> （没跑任何用例），`hil.py` 据此判 FAIL，整条 HIL 循环被打断。
+
 ---
 
 ## 三、换工程文件夹（新项目）怎么做
@@ -91,12 +144,14 @@
 5. `~/embedded-ai-journey/`（能力进度）
 6. `~/.claude/skills/ai-embedded-autolab`（流程定义）
 
-### 为此要做的加固（当前**未完成**）
+### 已经做过的加固（2026-10-11 核对）
 - [x] `requirements.txt` 锁定 pip 依赖
-- [ ] **把所有写死的本机路径改成"环境变量 + 默认值"**
-      当前还有两处没加覆盖：`tools/debug_probe.py` 的 `FROMELF`、
-      `tools/hil.py` 的 `UVISION`（`tests/test_static.py` 已经支持 `AUTOLAB_FROMELF`）
-- [ ] **`tools/preflight.py`**（上面第 3 条）
+- [x] **写死的本机路径全部改成"环境变量 + 默认值"**
+      `AUTOLAB_UVISION`（Keil 位置）、`AUTOLAB_FROMELF`（符号表工具）。
+      `tools/hil.py` 现在**完全不持有 Keil 路径** —— 构建/烧录都委托给适配器脚本
+      （`tools/build.py` / `tools/flash.py`），它自己只认退出码。
+- [x] **`tools/preflight.py`**（上面第 3 条）—— 已完成；
+      它还会报告串口参数是取自 `project.cfg` 还是退回了内置默认
 
 ---
 

@@ -90,16 +90,73 @@ CubeMX 模板默认假设 **25 MHz**，而很多板子是 **8 MHz**。
 
 ---
 
+## 7. 🔴 平台化改造时踩到的三个坑（2026-10-11）
+
+这三条跟"芯片"无关，是**工具/流程**层面的 —— 但和 §5 一样属于"在这个工程里会反复咬人"，
+所以在同一个工程里实测出来后就记在这里。
+
+### 7.1 argparse 的 `default=` 会让"没传参"变得不可区分
+
+**现象**：`--port` 原本是 `default="COM9"`。于是工具**永远无法判断**
+用户是"没传 `--port`"还是"主动传了 COM9" —— argparse 填进去的默认值
+和用户显式传的值长得一模一样。
+
+**后果**：环境变量 `AUTOLAB_PORT` **永远轮不到生效**。
+实测过这个具体形态：平台文档写着"串口端口可用 `AUTOLAB_PORT` 覆盖"，
+但只有 `test_device.py` 认它，`serial_tool.py` 自己不认。
+
+**改法**：凡是参与优先级解析的参数，`default` 一律设 `None`，
+解析完再按 `CLI > 环境变量 > project.cfg > 内置默认` 统一合成。
+
+> 加新参数时留意：任何"带默认值"的开关，都可能悄悄吃掉环境变量或工程配置。
+
+### 7.2 `.gitignore` 不支持"规则 + 行尾注释"
+
+**错的写法** —— 整条规则失效：`#` 后面那串会**变成规则本身的一部分**。
+
+```
+runs/                # hil.py 的取证目录
+```
+
+**对的写法**：规则独占一行，注释放上一行。
+
+```
+# hil.py 的取证目录
+runs/
+```
+
+只有**行首**的 `#` 才是注释。第一次写 `.gitignore` 的人几乎都会踩这一下。
+
+### 7.3 `pytest.ini` 与 `hil.py` 必须**同批**迁移
+
+`skeleton/pytest.ini` 的 `addopts` 现在默认排除 `hardware`（裸跑 `pytest`
+不会碰板子/串口 —— 这是有意的）。
+
+**副作用**：`hil.py` 调 pytest 跑真机用例时**必须显式加 `-m hardware`**。
+否则真机用例全部被 deselect，pytest 返回**退出码 5（没跑任何用例）**，
+而 `hil.py` 只看 `rc == 0` → **整条 HIL 循环被判 FAIL**。
+
+**实测证据**：不写 `-m hardware` 跑 `test_device.py`，输出就是
+`no tests collected (7 deselected)`、`exit=5`。
+
+**规矩**：
+- 两个文件**同批同步**，或**先同步 `hil.py`**（它多一个 `-m hardware` 无副作用）
+- ⚠️ **只同步 `pytest.ini` 会立刻打断 HIL**
+
+---
+
 ## 附：这个适配器里有什么
 
 | 文件 | 作用 |
 |---|---|
-| `tools/build.py` | Keil 构建 + 四判据（读 `AUTOLAB_UVISION`） |
+| `tools/build.py` | Keil 构建 + 四判据（读 `AUTOLAB_UVISION`；工程名/路径/阈值取自工程配置） |
+| `tools/flash.py` | Keil 烧录（`uVision.com -f`）+ `Verify OK` 判定；`--dry-run` 只打印命令、**不启动 uVision** |
 | `tools/debug_probe.py` | pyocd 封装：快照 / 断点 / **故障现场**（读 `AUTOLAB_FROMELF`） |
 | `tools/check_ioc.py` | CubeMX `.ioc` ↔ 代码 一致性 |
 | `tools/serial_probe.py`、`tools/timing_probe.py` | 历史诊断工具（时序探针需"突发固件"，当前固件是回显，暂不可用） |
-| `tests/test_build.py`、`test_static.py`、`test_ioc.py` | 无板层的适配器部分 |
-| `tests/test_device.py` | 真机层的串口用例 |
+| `tests/test_build.py`、`test_static.py`、`test_ioc.py`、`test_build_paths.py`、`test_flash.py` | 无板层的适配器部分 |
+| `tests/test_device.py` | 真机层的串口用例（**跑它必须显式 `-m hardware`**，见 §7.3） |
+| `project.cfg.example` | **工程级参数的模板**：拷成 `<工程>/tools/project.cfg` 再用（含工程名、路径、阈值、内存预算、必需符号、串口参数） |
 
 > ⚠️ 这里是**参考实现（快照）**。正在用的副本在各工程里 ——
 > 改了行为要**两边同步**，或直接以工程为准、需要时覆盖回来。

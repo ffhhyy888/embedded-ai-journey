@@ -2,17 +2,21 @@
 """HIL 主控 —— 一条命令跑完整轮次：构建 -> 烧录 -> 真机判定 -> 失败自动取证 -> 出报告。
 
 为什么需要它
-    零件早就齐了：build.py(构建)、uVision.com -f(烧录)、serial_tool.py(激励+观测)、
+    零件早就齐了：build.py(构建)、flash.py(烧录)、serial_tool.py(激励+观测)、
     debug_probe.py(运行态现场)、pytest(判定)。但**是分散的**，靠人一条条敲 ——
     人一累就会漏步骤、漏证据。本脚本把它们编排成**可重复的轮次**，
     失败时自动取证，并把证据整理成**人能直接读的报告**。
 
-一轮做什么
-    1. 构建    tools/build.py             （四判据）
-    2. 烧录    uVision.com -f             （Erase Sectors + Program + Verify + Reset&Run）
+一轮做什么（本文件只做**编排**，不含任何工具链知识）
+    1. 构建    tools/build.py             （适配器，四判据）
+    2. 烧录    tools/flash.py             （适配器；本文件不直接调 Keil）
     3. 判定    pytest tests/test_device.py（真机用例，复用已验证的判据）
     4. 失败取证（任一步失败都触发）
     5. 生成报告 runs/<时间戳>_FAIL/report.md（证据 -> 判断依据 -> 下一步建议）
+
+    构建/烧录分别由 tools/build.py 与 tools/flash.py 提供，本文件只认它们的退出码
+    （0=PASS / 1=FAIL / 2=ERROR），不知道背后是 uVision 还是别的工具。
+    工程名、路径、阈值一律来自 tools/project.cfg。
 
 【停止条件 —— 刻意写死在这里】
     - **不做无界重试**：--attempts 默认 1，硬上限 3；一旦某轮 PASS 立即停止
@@ -36,14 +40,31 @@ import subprocess
 import sys
 import time
 
+import project_config   # 与本文件同目录（拷进工程后同样在 tools/ 下）
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = sys.executable
-AXF = os.path.join(ROOT, "MDK-ARM", "SDIO_test", "SDIO_test.axf")
-FLASH_LOG = os.path.join(ROOT, "MDK-ARM", "flash.log")
+TOOLS = os.path.join(ROOT, "tools")
 RUNS = os.path.join(ROOT, "runs")
-UVISION = os.environ.get("AUTOLAB_UVISION", r"F:\keil\UV4\uVision.com")
 
 MAX_ATTEMPTS_HARD = 3      # 硬上限：任何情况下都不允许超过
+# 调用 tools/flash.py 的超时。必须**大于** flash.py 内部对烧录工具的超时
+# （默认 180s，可用 AUTOLAB_FLASH_TIMEOUT 覆盖），否则会先被这里掐断。
+FLASH_STEP_TIMEOUT = int(os.environ.get("AUTOLAB_HIL_FLASH_TIMEOUT", "300"))
+
+_CFG = None
+
+
+def config():
+    """工程配置（惰性加载 + 进程内缓存）。
+
+    ⚠️ 不在 import 期加载：只想 import 本模块（例如跑单元测试）时，
+       不应该强制要求工程已经把 project.cfg 配好。
+    """
+    global _CFG
+    if _CFG is None:
+        _CFG = project_config.load(TOOLS)
+    return _CFG
 
 
 def run(argv, timeout=600, cwd=ROOT):
@@ -59,10 +80,11 @@ def run(argv, timeout=600, cwd=ROOT):
 def firmware_fingerprint():
     """证据里必须能唯一对上"当时烧的是哪一版"。"""
     fp = {}
-    if os.path.exists(AXF):
-        fp["axf_sha256"] = hashlib.sha256(open(AXF, "rb").read()).hexdigest()[:16]
+    axf = str(config().path("build", "axf"))   # 产物路径来自 project.cfg，不写死工程名
+    if os.path.exists(axf):
+        fp["axf_sha256"] = hashlib.sha256(open(axf, "rb").read()).hexdigest()[:16]
         fp["axf_mtime"] = time.strftime("%Y-%m-%d %H:%M:%S",
-                                        time.localtime(os.path.getmtime(AXF)))
+                                        time.localtime(os.path.getmtime(axf)))
     rc, out, _ = run(["git", "rev-parse", "--short", "HEAD"])
     fp["git_head"] = out.strip() if rc == 0 else "?"
     rc, out, _ = run(["git", "status", "--porcelain"])
@@ -79,26 +101,55 @@ def firmware_fingerprint():
 
 # ---------------------------------------------------------------- 失败取证
 
+def _write(path, text):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def run_evidence_tool(tool_name, argv, dest, timeout):
+    """跑一个取证工具并把原始输出落盘。返回 (状态, 说明)。
+
+    三态**刻意区分**，对应两种完全不同的情况：
+        SKIP —— 本工程没有这个工具（该芯片家族没提供这项能力）：不是失败，
+                但必须显式记下来，否则会被误读成"取证做了、没发现问题"
+        PASS —— 工具在，且退出码 0
+        FAIL —— 工具在，但执行失败（退出码非 0 / 超时）：如实记录，**绝不吞掉**
+    """
+    tool = os.path.join(TOOLS, tool_name)
+    if not os.path.exists(tool):
+        _write(dest, f"SKIP: 本工程没有 tools/{tool_name}"
+                     f"（该芯片家族未提供此取证能力）\n")
+        return "SKIP", f"缺 tools/{tool_name}"
+
+    try:
+        rc, out, err = run([PY, tool] + argv, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _write(dest, f"FAIL: 超过 {timeout}s 未返回\n")
+        return "FAIL", f"tools/{tool_name} 超时（>{timeout}s）"
+
+    _write(dest, f"status={'PASS' if rc == 0 else 'FAIL'} exit={rc}\n{out}\n{err}\n")
+    return ("PASS" if rc == 0 else "FAIL"), f"tools/{tool_name} exit={rc}"
+
+
 def collect_evidence(ev, notes):
     os.makedirs(ev, exist_ok=True)
-    with open(os.path.join(ev, "fingerprint.json"), "w", encoding="utf-8") as f:
-        json.dump(firmware_fingerprint(), f, ensure_ascii=False, indent=2)
+    _write(os.path.join(ev, "fingerprint.json"),
+           json.dumps(firmware_fingerprint(), ensure_ascii=False, indent=2))
 
-    for argv, name, tmo in (
+    for tool_name, argv, name, tmo in (
         # --reset 是最有诊断力的一项：它主动激励并期待启动标记，
         # 而 --monitor 对"空闲时本来就静默"的固件只能收到 0 字节，说明不了问题
-        (["--reset", "--timeout", "6"], "serial_reset.txt", 90),
-        (["--monitor", "2"], "serial_monitor.txt", 60),
-        (["--snapshot"], "debug_snapshot.txt", 180),
-        (["--fault"], "debug_fault.txt", 180),
+        ("serial_tool.py", ["--reset", "--timeout", "6"], "serial_reset.txt", 90),
+        ("serial_tool.py", ["--monitor", "2"], "serial_monitor.txt", 60),
+        ("debug_probe.py", ["--snapshot"], "debug_snapshot.txt", 180),
+        ("debug_probe.py", ["--fault"], "debug_fault.txt", 180),
     ):
-        tool = "serial_tool.py" if name.startswith("serial") else "debug_probe.py"
-        rc, out, err = run([PY, os.path.join(ROOT, "tools", tool)] + argv, timeout=tmo)
-        with open(os.path.join(ev, name), "w", encoding="utf-8") as f:
-            f.write(f"exit={rc}\n{out}\n{err}\n")
+        status, detail = run_evidence_tool(tool_name, argv, os.path.join(ev, name), tmo)
+        notes.append(f"取证 {name}: {status} ({detail})")
 
-    if os.path.exists(FLASH_LOG):
-        shutil.copy(FLASH_LOG, os.path.join(ev, "flash.log"))
+    flash_log = str(config().path("flash", "log"))
+    if os.path.exists(flash_log):
+        shutil.copy(flash_log, os.path.join(ev, "flash.log"))
     notes.append(f"取证目录: {os.path.relpath(ev, ROOT)}")
 
 
@@ -201,9 +252,27 @@ def write_report(path, steps, notes, ev, findings):
 
     lines += ["## 本报告**不能**证明的", "",
               "- 只能证明「这一版固件、在这一台板子上、这一次运行」的表现",
-              "- 不覆盖：长时稳定性、温度/电压边界、其它板子/其它 SD 卡、EMC", ""]
+              "- 不覆盖：长时稳定性、温度/电压边界、其它板子/同型号的不同个体、EMC", ""]
 
     open(path, "w", encoding="utf-8").write("\n".join(lines))
+
+
+# ---------------------------------------------------------------- 步骤
+
+def step_flash():
+    """烧录一步：**交给适配器**。返回 (是否通过, 说明)。
+
+    ⚠️ 会改动目标板上的程序 —— 走到这里就意味着已获得人工授权。
+    本文件只认 tools/flash.py 的退出码（0=PASS / 1=FAIL / 2=ERROR），
+    既不解析它的日志，也不知道它背后是 uVision 还是别的工具。
+    """
+    tool = os.path.join(TOOLS, "flash.py")
+    if not os.path.exists(tool):
+        return False, "缺少适配器 tools/flash.py —— 该芯片家族未提供烧录能力"
+    rc, out, err = run([PY, tool], timeout=FLASH_STEP_TIMEOUT)
+    if rc == 0:
+        return True, "适配器判定 PASS（Verify OK）"
+    return False, f"tools/flash.py 退出码={rc}；{(out + err).strip()[:200]}"
 
 
 # ---------------------------------------------------------------- 主流程
@@ -217,6 +286,12 @@ def main():
                          "用于对付偶发的硬件掉线，不是「重试直到成功」")
     a = ap.parse_args()
     attempts = max(1, min(a.attempts, MAX_ATTEMPTS_HARD))
+
+    try:
+        config()          # 早失败：工程配置不可用就别开始跑轮次
+    except project_config.ConfigError as e:
+        print(f"[FAIL] 工程配置不可用：\n{e}")
+        return 1
 
     for attempt in range(1, attempts + 1):
         stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -247,9 +322,9 @@ def main():
             print(f"产物目录: {os.path.relpath(rundir, ROOT)}")
             return 0 if ok else 1
 
-        # 1) 构建
+        # 1) 构建 —— 交给适配器 tools/build.py
         if not a.skip_build:
-            rc, out, err = run([PY, os.path.join(ROOT, "tools", "build.py")])
+            rc, out, err = run([PY, os.path.join(TOOLS, "build.py")])
             ok = rc == 0
             steps.append(("build", ok, "四判据 PASS" if ok else "构建失败（见证据）"))
             if not ok:
@@ -260,14 +335,10 @@ def main():
         else:
             steps.append(("build", True, "skipped"))
 
-        # 2) 烧录
+        # 2) 烧录 —— 交给适配器 tools/flash.py，本文件不碰 Keil
         if not a.skip_flash:
-            rc, out, err = run([UVISION, "-f", "SDIO_test.uvprojx", "-j0", "-o", "flash.log"],
-                               cwd=os.path.join(ROOT, "MDK-ARM"), timeout=180)
-            log = (open(FLASH_LOG, encoding="utf-8", errors="replace").read()
-                   if os.path.exists(FLASH_LOG) else "")
-            ok = (rc == 0) and ("Verify OK" in log)
-            steps.append(("flash", ok, "Verify OK" if ok else f"退出码={rc}；{log.strip()[:160]}"))
+            ok, detail = step_flash()
+            steps.append(("flash", ok, detail))
             if not ok:
                 return finish(False)
             time.sleep(0.5)
@@ -275,7 +346,11 @@ def main():
             steps.append(("flash", True, "skipped"))
 
         # 3) 真机判定
-        rc, out, err = run([PY, "-m", "pytest", "tests/test_device.py", "-q"], timeout=900)
+        # 必须显式 -m hardware：pytest.ini 的 addopts 默认排除 hardware，
+        # 不写这一项会把真机用例全部 deselect，pytest 以退出码 5（没跑任何用例）返回，
+        # 于是这一步会被误判成 FAIL。
+        rc, out, err = run([PY, "-m", "pytest", "tests/test_device.py", "-q", "-m", "hardware"],
+                           timeout=900)
         ok = rc == 0
         tail = [l for l in out.strip().splitlines() if l.strip()][-1:] or [""]
         steps.append(("device-tests", ok, tail[0][:120]))

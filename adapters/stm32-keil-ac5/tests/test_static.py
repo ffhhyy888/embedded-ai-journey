@@ -20,20 +20,30 @@ import subprocess
 
 import pytest
 
+import project_config   # sys.path 由本目录的 conftest.py 引导
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-AXF = os.path.join(ROOT, "MDK-ARM", "SDIO_test", "SDIO_test.axf")
-LOGS = os.path.join(ROOT, "tools", "build_logs")
+TOOLS_DIR = os.path.join(ROOT, "tools")
+LOGS = os.path.join(TOOLS_DIR, "build_logs")
+# 机器级：fromelf 装在哪 —— 换电脑才变，走环境变量而不是 project.cfg
 FROMELF = os.environ.get("AUTOLAB_FROMELF", r"F:\keil\ARM\ARMCC\bin\fromelf.exe")
 
-FLASH_SIZE = 512 * 1024          # STM32F407VET6
-RAM_SIZE = 128 * 1024
+# 家族常量：Cortex-M 从 Flash 启动的基址 / SRAM 起始。
+# 这些是**芯片家族**的东西，不是工程级参数，所以留在适配器里，不进 project.cfg。
+VECTOR_BASE = 0x08000000
+SRAM_BASE = 0x20000000
+
+
+def _cfg():
+    """工程配置。缺失即抛 ConfigMissing —— 用例会 FAIL 并给出修复提示，不静默跳过。"""
+    return project_config.load(TOOLS_DIR)
 
 
 # --------------------------------------------------------------- 辅助
 
 def symbols():
     """从 fromelf 符号表取 (地址, 大小, 名字, 类型)。"""
-    out = subprocess.run([FROMELF, "--text", "-s", AXF],
+    out = subprocess.run([FROMELF, "--text", "-s", str(_cfg().path("build", "axf"))],
                          capture_output=True, timeout=60).stdout.decode("utf-8", "replace")
     pat = re.compile(r"^\s*\d+\s+(\S+)\s+0x([0-9a-fA-F]{8})\s+\S+\s+\d+\s+(\S+)\s+\S+\s*(0x[0-9a-fA-F]+)?\s*$")
     out_syms = []
@@ -78,18 +88,23 @@ def test_image_fits_flash_and_ram():
     assert m, "构建日志里没有 Program Size 行"
     code, ro, rw, zi = (int(x) for x in m.groups())
 
+    flash_size = _cfg().int("image", "flash_size")
+    ram_size = _cfg().int("image", "ram_size")
     flash_used = code + ro + rw
     ram_used = rw + zi
-    assert flash_used <= FLASH_SIZE, f"Flash 超了: {flash_used} > {FLASH_SIZE}"
-    assert ram_used <= RAM_SIZE, f"RAM 超了: {ram_used} > {RAM_SIZE}"
+    assert flash_used <= flash_size, f"Flash 超了: {flash_used} > {flash_size}"
+    assert ram_used <= ram_size, f"RAM 超了: {ram_used} > {ram_size}"
 
 
 def test_required_symbols_present():
-    """关键函数必须都编进镜像：串口中断、SDIO 初始化、时钟配置。"""
+    """关键函数必须都编进镜像（清单来自 project.cfg 的 [image] required_symbols）。"""
+    want = _cfg().list("image", "required_symbols")
+    if not want:
+        pytest.skip("project.cfg 未配置 [image] required_symbols —— 跳过"
+                    "（显式跳过，不静默通过）")
     names = {s[2] for s in symbols()}
-    for want in ("main", "SystemClock_Config", "MX_SDIO_SD_Init",
-                 "HAL_UART_RxCpltCallback", "HAL_UART_ErrorCallback"):
-        assert want in names, f"镜像里缺少符号 {want}"
+    for name in want:
+        assert name in names, f"镜像里缺少符号 {name}"
 
 
 def test_no_demo_or_debug_leftovers():
@@ -105,16 +120,19 @@ def test_no_demo_or_debug_leftovers():
 
 def test_vector_table_looks_bootable():
     """向量表头两项必须合理：初始 SP 落在 SRAM，复位向量落在 Flash 且为 Thumb。"""
-    base, (sp, reset) = elf_first_load_words(AXF)
-    assert base == 0x08000000, f"镜像加载基址异常: 0x{base:08X}"
-    assert 0x20000000 <= sp <= 0x20000000 + RAM_SIZE, f"初始 SP 不在 SRAM: 0x{sp:08X}"
-    assert 0x08000000 <= (reset & ~1) < 0x08000000 + FLASH_SIZE, f"复位向量不在 Flash: 0x{reset:08X}"
+    cfg = _cfg()
+    ram_size = cfg.int("image", "ram_size")
+    flash_size = cfg.int("image", "flash_size")
+    base, (sp, reset) = elf_first_load_words(cfg.path("build", "axf"))
+    assert base == VECTOR_BASE, f"镜像加载基址异常: 0x{base:08X}"
+    assert SRAM_BASE <= sp <= SRAM_BASE + ram_size, f"初始 SP 不在 SRAM: 0x{sp:08X}"
+    assert VECTOR_BASE <= (reset & ~1) < VECTOR_BASE + flash_size, f"复位向量不在 Flash: 0x{reset:08X}"
     assert reset & 1, "复位向量最低位应为 1（Thumb 状态）"
 
 
 def test_elf_has_debug_info():
     """镜像必须带调试信息，否则 Stage 5 的调试能力会整体失效。"""
-    d = open(AXF, "rb").read()
+    d = open(_cfg().path("build", "axf"), "rb").read()
     for sec in (b".debug_info", b".debug_line"):
         assert sec in d, f"缺少调试信息段 {sec.decode()}"
 

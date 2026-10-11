@@ -2,6 +2,74 @@
 
 > 规则：只有真实执行并观察到结果的行才写「已验证」。其余一律标「未验证」。
 
+---
+
+## 当前测试清单与运行方式（2026-10-11 核对）
+
+> 下面各节是**分阶段的实测记录**，保留原样，其中的命令与计数**是当时的**。
+> **"现在有哪些文件、现在怎么跑"看这一节。**
+
+### 测试文件清单
+
+| 概念层 | 文件 | pytest marker |
+|---|---|---|
+| 单元 | `skeleton/tests/test_project_config.py` | `nohardware` |
+| 单元 | `skeleton/tests/test_serial_tool.py` | `nohardware` |
+| 单元 | `skeleton/tests/test_preflight.py` | `nohardware` |
+| 单元 | `skeleton/tests/test_hil.py` | `nohardware` |
+| 单元（在 PC 上跑固件里的真实代码） | `skeleton/tests/test_host.py` + `skeleton/tests/host/test_ringbuf.c` | `nohardware` |
+| 集成（要工具链/产物） | `adapters/stm32-keil-ac5/tests/test_build.py` | `nohardware` |
+| 集成 | `…/tests/test_build_paths.py`（路径解析 + 四判据，**不起 Keil**） | `nohardware` |
+| 集成 | `…/tests/test_flash.py`（烧录适配器，**不启动 uVision**） | `nohardware` |
+| 集成 | `…/tests/test_static.py`（镜像契约） | `nohardware` |
+| 集成 | `…/tests/test_ioc.py`（`.ioc` ↔ 代码一致性） | `nohardware` |
+| **真机** | `…/tests/test_device.py`（串口链路） | **`hardware`** |
+
+拷进工程后两组文件都落在 `<工程>/tests/` 下；两边各有一份 `conftest.py`
+（只负责把 `tools/` 加进 `sys.path`，**行为一致**），覆盖任一份都不影响结果。
+
+### 三个概念层 vs 两个 marker
+
+| 概念层 | 需要什么才能跑 |
+|---|---|
+| **unit** | 只要 Python（`test_host` 另需 `ziglang`） |
+| **integration** | 还要**工具链与产物**：Keil / `.axf` / 构建日志 / `.ioc` |
+| **hardware** | 还要**真板子 + 串口** |
+
+⚠️ **marker 只在"要不要硬件"这条线上切一刀**，只有 `hardware` / `nohardware` 两个
+（定义见 `skeleton/pytest.ini`）。**没有 `integration` 这个 marker** ——
+integration 那一层**属于 `nohardware`**，它是靠"依赖工具链/产物"区分的，不是靠标记。
+写选择器时别用 `-m integration`，它匹配不到任何东西。
+
+### 怎么跑
+
+```bash
+pytest                     # 默认：跑 nohardware（**不碰板子/串口**）
+pytest -m hardware         # 显式跑真机用例
+pytest -m "not hardware"   # 同上，显式写法（pre-commit 用的是这个）
+```
+
+⚠️ `pytest.ini` 的 `addopts` **默认排除 `hardware`**（2026-10-11 起）。两条后果：
+
+1. 裸跑 `pytest` 不会占用串口 —— 这是有意的
+2. **程序化调用必须显式加 `-m hardware`**：`tools/hil.py` 已经这么写了。
+   这两个文件**必须同批迁移** —— 只改 `pytest.ini` 会让 pytest 返回**退出码 5**
+   （没跑任何用例），`hil.py` 据此判 FAIL，整条 HIL 循环被打断。
+
+### 配置从哪来
+
+所有取值走同一条链，由 `skeleton/tools/project_config.py` 的 `resolve()` **一处**实现：
+
+```
+CLI 参数  >  环境变量  >  tools/project.cfg  >  内置默认
+```
+
+串口四项里**只有 `port` 认环境变量**（`AUTOLAB_PORT`）；`baud` / `boot_marker` /
+`reset_cmd_hex` 只看 CLI / cfg / 默认。完整说明见
+`docs/AUTOLAB_ARCHITECTURE.md` 第二节「配置从哪来」。
+
+---
+
 ## Build — ✅ 已验证（L2：一键执行 + 自动判定）
 
 ### 工具与命令
@@ -124,8 +192,10 @@ python -c "import serial; s=serial.Serial('COM9',115200,timeout=3); d=s.read(400
 
 ## 回归套件（Stage 4）— ✅ 已跑通（2026-10-10）
 
-- Command: `python -m pytest tests/ -v`（前置：固件已烧录、COM9 已接好）
-- 结果: **8 passed（20.8s）** —— 缺陷修复后已全绿
+- Command（当时）: `python -m pytest tests/ -v`（前置：固件已烧录、COM9 已接好）
+  > ⚠️ 这条命令**现在不会执行真机用例**了 —— `pytest.ini` 默认排除 `hardware`，
+  > 要跑这一节列的用例必须显式 `-m hardware`（见文首）
+- 结果（当时）: **8 passed（20.8s）** —— 缺陷修复后已全绿
 - 取证: 每次调用工具都把原始输出落盘 `tests/artifacts/`（已 gitignore）
 
 | 用例 | 类型 | 结果 |
@@ -264,6 +334,9 @@ python -c "import serial; s=serial.Serial('COM9',115200,timeout=3); d=s.read(400
 | `test_host.py` | **在 PC 上执行固件里的真实代码**（同一份 ringbuf.h） | ❌ |
 | `test_device.py` | 串口电气/SD 卡握手等**仿真覆盖不到**的行为 | ✅ |
 
+> ⚠️ 这只是**当时的三类**。现在骨架与适配器合起来共 11 个测试文件
+> —— 完整清单与它们的分层见文首「当前测试清单与运行方式」。
+
 ### 真机验证（2026-10-11）
 重构后固件烧录 → `Verify OK` → **全量 14 passed**（无板 7 = 构建1+静态5+宿主1 ｜ 真机 7）
 
@@ -280,9 +353,9 @@ python tools/hil.py --skip-flash   # 只判定
 ### 一轮包含
 | 步骤 | 做什么 | 判据 |
 |---|---|---|
-| build | `tools/build.py` | 四判据（退出码/0错0警/编译动作数/产物时间戳） |
-| flash | `uVision.com -f` | 退出码 0 **且** 日志含 `Verify OK` |
-| device-tests | `pytest tests/test_device.py` | 退出码 0（**复用已验证的真机用例，不重复造**） |
+| build | `tools/build.py`（适配器） | 四判据（退出码/0错0警/编译动作数/产物时间戳） |
+| flash | `tools/flash.py`（适配器；`uVision.com -f` 现在只在它内部） | 退出码 0（`Verify OK` 由它自己判） |
+| device-tests | `pytest tests/test_device.py -q -m hardware` | 退出码 0（**复用已验证的真机用例，不重复造**）<br>⚠️ `-m hardware` **不能省**：`pytest.ini` 默认排除它，漏了会拿到退出码 5 而被误判 FAIL |
 | 失败取证 | 任一步失败即触发 | 落到 `runs/<时间戳>_FAIL/evidence/` |
 
 ### 证据包内容（`runs/<时间戳>_FAIL/`）
@@ -315,8 +388,13 @@ python tools/hil.py --skip-flash   # 只判定
 ### 测试分层（`pytest.ini`）
 | 标记 | 含义 | 命令 |
 |---|---|---|
-| `nohardware` | 不依赖任何硬件 | `pytest -m "not hardware"`（**CI 层1**） |
+| `nohardware` | 不依赖任何硬件 | `pytest` 或 `pytest -m "not hardware"`（**CI 层1**） |
 | `hardware` | 需要真机（板子/串口/调试器） | `pytest -m hardware`（**CI 层2**） |
+
+> ⚠️ **这两个标记就是全部** —— 平台**没有** `integration` 标记（integration 那一层
+> 属于 `nohardware`，靠"依赖工具链/产物"区分，不靠 marker）。
+> 且 `pytest.ini` 的 `addopts` **默认排除 `hardware`**（2026-10-11 起）：
+> 裸跑 `pytest` 就是层1，不碰板子。
 
 真机用例是好的，但**不能作为"持续"的基础**：硬件一掉线就变成随机红灯，
 红灯一多就没人看了。（本工程已经出现过两次 USB 掉线。）
@@ -341,6 +419,8 @@ python tools/hil.py --skip-flash   # 只判定
 - 失败自动上传 `runs/**/evidence/`（复用 hil.py 的证据包）
 - **⚠️ 本仓库无 remote，该文件从未在真实 CI 上跑过** —— 本地等价物是
   `pre-commit`(层1) 与 `tools/hil.py`(层2)，两者都已验证
+- **⚠️ 该文件不在平台仓库**：平台仓库里**根本没有 `.github/`**（已核实）。
+  它属于**具体工程仓库**（SDIO_test 里有一份）。平台侧只提供层1的 hook 与层2的 `hil.py`。
 
 ## CubeMX 配置一致性（Stage 9）— ✅ 已验证（2026-10-11）
 
@@ -428,9 +508,13 @@ KiCad 那套（ERC/DRC/BOM/Gerber）**不适用**，如实记录，不硬凑流�
 > 比没有结论更危险 —— 它会把人带向错误的假设。
 
 ## Regression
-- Command: `python -m pytest tests/ -v`
-- Expected result: 8 passed
-- 状态: **✅ 全部通过**（8 passed / 20.8s）
+- Command:
+  - 无板层：`python -m pytest`（默认排除硬件 —— **这条不碰板子**）
+  - 真机层：`python -m pytest -m hardware`（需板子 + 串口）
+- Expected result: 无板层必须全过；真机层单列，需硬件在位
+- 状态: **无板层 ✅**；真机层见文首「当前测试清单与运行方式」
+  > 本节原先写的 `pytest tests/ -v` / `8 passed` 是 **2026-10-10 的旧契约**：
+  > 那个命令现在**不会执行真机用例**（被 `addopts` 默认排除），条数也早已变化。
 
 ## 环境事实（已核实 2026-10-09/10）
 - git 2.54.0 ✅ | Python 3.12.1 ✅ | pyserial 3.5 ✅

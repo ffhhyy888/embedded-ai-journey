@@ -11,6 +11,12 @@
     python tools/preflight.py                # 只查不碰硬件
     python tools/preflight.py --with-hardware  # 额外探测串口/调试器（不复位、不烧录）
 退出码：0 = 关键项全过；1 = 有致命项未过
+
+串口参数从哪来
+    端口 / 波特率 / 启动标记**不在这里写死**：复用 tools/serial_tool.py 的解析，
+    即 CLI > AUTOLAB_PORT > tools/project.cfg > 内置默认。
+    没有 project.cfg 时本工具**不中止**（它是诊断工具，可以脱离工程用），
+    但会把每一处降级作为 [WARN] 列出来 —— 降级允许，静默不允许。
 """
 import argparse
 import importlib
@@ -120,13 +126,56 @@ def check_git():
             "git config core.hooksPath tools/hooks   # 启用提交前自动检查")
 
 
-def check_hardware():
-    port = os.environ.get("AUTOLAB_PORT", "COM9")
+def check_serial_params():
+    """串口参数（端口 / 波特率 / 启动标记）—— **复用 serial_tool 的解析**。
+
+    为什么复用而不是另写一遍：这样"自检看到的参数"与"真正跑测试时用的参数"
+    必然一致 —— 同一份 tools/project.cfg、同一条优先级
+    （CLI > AUTOLAB_PORT > project.cfg > 内置默认）。另写一遍迟早会漂移。
+
+    本工具可以脱离工程单独使用：没有 project.cfg 时退回内置默认，
+    并把每一处降级**逐条**作为 [WARN] 列出来 —— 降级允许，静默不允许。
+    返回 (port, baud)；不可用时返回 (None, None)。
+    """
+    sys.path.insert(0, os.path.join(ROOT, "tools"))
+    try:
+        import project_config
+        import serial_tool
+    except ModuleNotFoundError as e:
+        fix = ("python -m pip install -r requirements.txt" if e.name == "serial"
+               else f"确认 tools/{e.name}.py 已拷进工程（骨架是不是没拷全？）")
+        add("SKIP", "串口参数", f"无法复用 tools/serial_tool.py（缺模块 `{e.name}`）", fix)
+        return None, None
+
+    try:
+        cfg = project_config.load(os.path.join(ROOT, "tools"))
+    except project_config.ConfigMissing:
+        cfg = None            # 诊断工具允许脱离工程；降级由下面的 [WARN] 明示
+
+    try:
+        st, notes = serial_tool.resolve_settings(None, None, None, cfg)
+    except ValueError as e:
+        add("FAIL", "串口参数", str(e), "修 tools/project.cfg 的 [serial] reset_cmd_hex")
+        return None, None
+
+    for note in notes:
+        add("WARN", "串口参数", note, "确认 tools/project.cfg 已按本工程填写")
+    if not notes:
+        # 只说"没有退回内置默认"，不声称来源是 cfg —— 端口也可能是 AUTOLAB_PORT 给的
+        add("OK", "串口参数",
+            f"port={st.port} baud={st.baud} boot_marker={st.expect!r}（未退回内置默认）")
+    return st.port, st.baud
+
+
+def check_hardware(port, baud):
+    if port is None:
+        add("SKIP", "串口", "串口参数不可用（见上一条）")
+        return
     try:
         import serial
-        s = serial.Serial(port, 115200, timeout=1)
+        s = serial.Serial(port, baud, timeout=1)
         s.close()
-        add("OK", "串口", f"{port} 可打开")
+        add("OK", "串口", f"{port} @ {baud} 可打开")
     except Exception as e:
         add("FAIL", "串口", f"{port} 打不开: {e}",
             f"确认 USB-TTL 已插好；端口号可能变了 -> 设环境变量 AUTOLAB_PORT，"
@@ -160,8 +209,9 @@ def main():
     check_pip_deps()
     check_toolchain()
     check_git()
+    port, baud = check_serial_params()      # 只读配置/环境变量，不碰硬件
     if a.with_hardware:
-        check_hardware()
+        check_hardware(port, baud)
 
     width = max(len(n) for _, n, _, _ in results) + 2
     print("=" * 72)
