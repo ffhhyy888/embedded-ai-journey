@@ -1,0 +1,26 @@
+#!/bin/sh
+# ============================================================
+# CI 层1 —— 提交前自动跑「不依赖硬件」的检查
+# ============================================================
+# 这就是最小规模的"持续集成"：**每次提交都自动跑，不合格直接拦住**。
+#
+# 放在仓库里（而不是 .git/hooks/）是为了**受版本控制**：
+#   启用:  git config core.hooksPath tools/hooks
+#   停用:  git config --unset core.hooksPath
+#   临时跳过某次:  git commit --no-verify
+#
+# 只跑层1（构建 + 静态 + 宿主机测试），**不碰硬件** ——
+# 因为真机一旦掉线就会变成随机红灯，红灯一多就没人看了。
+# 真机那一层由 tools/hil.py 按需触发。
+
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+PY="${AUTOLAB_PYTHON:-python}"
+echo "[ci] 层1: 构建 + 无板测试（不碰硬件）..."
+if ! "$PY" -m pytest -m "not hardware" -q; then
+    echo ""
+    echo "[ci] ✗ 层1 未通过 —— 提交已被拦截。"
+    echo "     先修好；确实要跳过这一次: git commit --no-verify"
+    exit 1
+fi
+echo "[ci] ✓ 层1 通过"
