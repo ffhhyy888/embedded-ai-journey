@@ -45,14 +45,17 @@ TMP="$(mktemp -d 2>/dev/null)" || { fail "无法创建临时目录"; TMP=""; }
 
 if [ -n "$TMP" ]; then
     if git checkout-index -f -a --prefix="$TMP/" 2>/dev/null; then
-        mkdir -p "$TMP/tools"
-        if [ -f tools/check_governance.py ]; then
-            cp tools/check_governance.py "$TMP/tools/"
-            if ! ( cd "$TMP" && "$PY" tools/check_governance.py ); then
+        # 检查器**必须来自同一份暂存区快照**。
+        # 用工作区版本覆盖它 = 拿"工作区的工具"去检查"暂存区的内容" ——
+        # 两者不一致时会给出错误结论（工具与内容必须同源）。
+        # 检查器读的是它自己 __file__ 推出的 ROOT，所以这里用绝对路径调用，
+        # 结果只取决于快照，与当前工作目录无关。
+        if [ -f "$TMP/tools/check_governance.py" ]; then
+            if ! "$PY" -B "$TMP/tools/check_governance.py"; then
                 fail "治理规则不一致（见上）—— 修好后重新 git add 再提交"
             fi
         else
-            fail "找不到 tools/check_governance.py（治理检查器缺失）"
+            fail "暂存区里没有 tools/check_governance.py —— 治理检查器必须与治理文档一起提交"
         fi
     else
         fail "无法导出暂存内容（index 异常）"
