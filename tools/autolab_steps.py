@@ -16,8 +16,10 @@
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -26,13 +28,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 # ============================================================================
-# 退出码（与阶段 1 授权一致）
+# 退出码（阶段 1 定下，阶段 2 启用 5）
 # ============================================================================
-EXIT_OK = 0            # 写入成功，且本阶段要求的初始化检查通过
+EXIT_OK = 0            # 写入成功，且本次请求的检查全部通过
 EXIT_INPUT = 2         # 参数 / 源文件 / 模板 / 配置错误；未对目标目录落盘
 EXIT_CONFLICT = 3      # 目标文件存在且内容不同，未加 --force；目标目录零变化
-EXIT_CHECKS_FAILED = 4 # 文件已经写入，但初始化后的检查未通过
-EXIT_CALIBRATION = 5   # 保留给后续阶段的阈值标定；本阶段不使用
+EXIT_CHECKS_FAILED = 4 # 文件已经写入，但初始化后的检查（L0/L1/L2）未通过
+EXIT_CALIBRATION = 5   # 阈值标定无法完成（计数不一致 / 构建失败 / 日志无效 /
+                       # AXF 未更新）；project.cfg 逐字节不变
 
 
 class InitError(Exception):
@@ -45,6 +48,27 @@ class ConflictError(InitError):
     """目标文件已存在且内容不同，且未给 --force。"""
 
     exit_code = EXIT_CONFLICT
+
+
+# ============================================================================
+# 机器可读的协议常量（工具之间靠它们对接；改一处就要改两处）
+# ============================================================================
+# `tools/build.py --measure` 的结果行前缀。适配器侧的对应常量是
+# adapters/*/tools/build.py 里的 MEASURE_PREFIX —— 两处必须一致。
+BUILD_MEASURE_PREFIX = "AUTOLAB_MEASURE="
+
+# 生成的 tools/project.cfg 里包住"阈值"那一段的标记。
+# 为什么用标记，而不是"找第 N 行 / 找正则"：换工程名、改注释文案、加 `;` 行尾注释
+# 都不会让标定写错地方；标记个数不为 1 时直接失败 —— 不做猜测式改写。
+CFG_BLOCK_BEGIN = "# --- autolab:min_compile_lines"
+CFG_BLOCK_END = "# --- /autolab:min_compile_lines"
+_CFG_BLOCK_RE = re.compile(
+    r"(?ms)^# --- autolab:min_compile_lines[^\n]*\n"
+    r".*?"
+    r"^# --- /autolab:min_compile_lines[^\n]*\n")
+# 生效的阈值。在标记块**之外**出现即拒绝改写：那会变成重复键，
+# configparser 会直接报错 —— 这种失败必须由本工具提前说清楚，不留给下游去猜。
+_LIVE_THRESHOLD_RE = re.compile(r"(?m)^\s*min_compile_lines\s*=")
 
 
 # ============================================================================
@@ -674,6 +698,44 @@ def render_gitignore(text: str, v: dict) -> str:
     return out
 
 
+def uncalibrated_threshold_block() -> str:
+    """`autolab init` 生成的「尚未标定」阈值块（带机器可读标记）。
+
+    与 `render_threshold_block()` 是**同一段文字的两种状态**：标定成功时
+    `autolab calibrate` 把这一整块换成带实测依据的那一块。两块都用同一对标记
+    夹住，所以"改哪里"是确定的，不靠找行号或正则猜。
+    """
+    L = [
+        CFG_BLOCK_BEGIN + "（未标定） ---",
+        "# 四判据之三的阈值：构建日志里 compiling/assembling/linking 的行数下界。",
+        "# 作用：防\"增量构建什么都没编却返回 0\"这种假 0。",
+        "#",
+        "# ⚠️⚠️ 【尚未标定】",
+        "#   build.py 用 cfg.int(\"build\", \"min_compile_lines\")（**无默认值**）读取本项，",
+        "#   所以此刻直接跑 `python tools/build.py` 会**报配置错误并退出 1**。",
+        "#   这是**有意的可见失败**，不是漏配：本工具不知道本工程一次全量构建会产生",
+        "#   多少条动作，而凭经验猜一个数会让判据 3 变成\"永远绿\"，比缺失更危险。",
+        "#",
+        "# 标定方式（自动跑两次**真实全量软件构建**；不烧录、不接调试器、不开串口）：",
+        "#   python tools/autolab.py calibrate --target <本工程根>",
+        "#   或在 `autolab init --run-checks` 里自动完成。",
+        "# 规则：连续两次构建的动作数一致、为正，且非阈值判据全过时，",
+        "#   取 floor(2/3 × 动作数) 为下界写回本文件。",
+        "#   计数不一致 / 任一构建失败 / 日志无效 / 产物时间戳未更新",
+        "#   -> 退出码 5，本文件**逐字节不变**。",
+        "# ⚠️ 只数**一份**日志 —— 某些编译器会把同一份日志同时写到 stdout 与",
+        "#    `-o` 指定的文件；把两者相加会让计数翻倍、阈值等于被绕过一半",
+        "#    （平台的适配器里真实发生过这个缺陷，已修）。",
+        "#",
+        "# 下面这一对标记是**机器读的**：`autolab calibrate` 只改这两个标记之间的内容",
+        "# （标定成功时，连同上面这段\"尚未标定\"的说明一起换掉）。",
+        "# 请勿删除或改名 —— 标记不是 1 个，标定会直接失败（不做猜测式改写）。",
+        "# min_compile_lines = <待标定>",
+        CFG_BLOCK_END + " ---",
+    ]
+    return "\n".join(L)
+
+
 def render_project_cfg(text: str, v: dict, cube: dict, ioc_data: dict) -> str:
     name = v["PROJECT_NAME"]
     uvprojx_rel = cube["uvprojx_rel"]
@@ -741,7 +803,8 @@ def render_project_cfg(text: str, v: dict, cube: dict, ioc_data: dict) -> str:
             "# 复制到新工程时，下列各项【必须重新校准】，不要照抄：\n"
             "#   1. [project] name               —— 工程名（= Keil 工程名 = 产物目录名）\n"
             "#   2. [build]   uvprojx / axf      —— 新工程的工程文件与产物路径\n"
-            "#   3. [build]   min_compile_lines  —— 必须按新工程【实测】的全量编译动作数重定\n"
+            "#   3. [build]   min_compile_lines  —— 必须按新工程【实测】重定（用 autolab calibrate）；\n"
+            "#                                      本例的 20 是参考工程的取值，**不是**新工程的实测值\n"
             "#   4. [serial]  port / baud        —— 换板子或换 USB 口后端口号会变\n"
             "#   5. [serial]  boot_marker        —— 新工程的启动契约多半与 SDIO_test 不同\n"
             "#   6. [image]   flash_size / ram_size / required_symbols —— 按新芯片与新工程填\n"
@@ -815,31 +878,19 @@ def render_project_cfg(text: str, v: dict, cube: dict, ioc_data: dict) -> str:
         (
             "# 四判据之三的阈值：构建日志里 compiling/assembling/linking 的行数下界。\n"
             "# 作用：防\"增量构建什么都没编却返回 0\"这种假 0。\n"
-            "# ⚠️ 必须按新工程【实测】标定：跑一次全量构建，数一下实际条数，\n"
-            "#    取一个\"真构建必然超过、空转必然达不到\"的安全下界。\n"
+            "# ⚠️ 必须按新工程【实测】标定，**不要照抄本文件的 20** —— 那是 SDIO_test 的值，\n"
+            "#    不是你的工程的实测值。抄错的后果是判据 3 形同虚设（永远绿）。\n"
+            "#\n"
+            "# 标定方式（自动跑两次真实全量软件构建；不烧录、不接调试器、不开串口）：\n"
+            "#   python tools/autolab.py calibrate --target <工程根>\n"
+            "#   或在 `autolab init --run-checks` 里自动完成。\n"
+            "# 规则：两次动作数一致且为正、且其余判据全过时，取 floor(2/3 × 动作数)。\n"
+            "# ⚠️ 由 `autolab init` 生成的工程里，这一行**先是注释**（<待标定>），\n"
+            "#    标定成功后由工具改写进标记块；本参考文件里的 20 只是历史取值，供对照。\n"
             "# 本例出处：SDIO_test 全量构建实测 56 条（见 tools/build_logs/ 的 PASS 日志），\n"
-            "#          取约 1/3 作为下界 20。\n"
+            "#          当时取约 1/3 作为下界 20。\n"
             "min_compile_lines = 20",
-            "# 四判据之三的阈值：构建日志里 compiling/assembling/linking 的行数下界。\n"
-            "# 作用：防\"增量构建什么都没编却返回 0\"这种假 0。\n"
-            "#\n"
-            "# ⚠️⚠️ 【尚未标定 —— autolab init 有意不填】\n"
-            "#   build.py 用 cfg.int(\"build\", \"min_compile_lines\")（**无默认值**）读取本项，\n"
-            "#   所以此刻直接跑 `python tools/build.py` 会**报配置错误并退出 1**。\n"
-            "#   这是**有意的可见失败**，不是漏配：本工具不知道本工程一次全量构建会产生\n"
-            "#   多少条动作，而凭经验猜一个数会让判据 3 变成\"永远绿\"，比缺失更危险。\n"
-            "#\n"
-            "# 标定步骤（跑一次真实全量构建，数出动作条数后再把下面这行取消注释）：\n"
-            "#   1) 临时把下面那行填成 1，让 build.py 先能跑；\n"
-            "#   2) python tools/build.py   （全量重建，日志归档到 tools/build_logs/）\n"
-            "#   3) 数日志里 compiling/assembling/linking 的行数 N。\n"
-            "#      ⚠️ 只数**一份**日志 —— 某些编译器会把同一份日志同时写到 stdout 与\n"
-            "#         `-o` 指定的文件；把两者相加会让计数翻倍、阈值等于被绕过一半\n"
-            "#         （平台的适配器里真实发生过这个缺陷，已修）。\n"
-            "#   4) 取一个\"真构建必然超过、空转必然达不到\"的下界，填回来并写清依据。\n"
-            "#   5) 反向标定同样要做：构造\"动作数刚好不够\"的日志喂给判定，看它会不会红。\n"
-            "#\n"
-            "# min_compile_lines = <待标定>",
+            uncalibrated_threshold_block(),
         ),
         # ---- [serial] ----
         (
@@ -1357,6 +1408,351 @@ def run_preflight(target: Path, python_exe=None, timeout: int = 300) -> dict:
 
 
 # ============================================================================
+# 跑目标工程自己的工具（L1 构建 / L2 测试）
+# ============================================================================
+# 骨架层**不碰**工具链细节：构建怎么调、日志长什么样，全是适配器的事。
+# 这里只做一件事：把 `python tools/<某个工具>` 跑起来，收回退出码与输出。
+# 与 run_preflight() 同构。
+def _child_env() -> dict:
+    """给被调用的工程工具一套**确定性**的 IO 编码。
+
+    Windows 上子进程 stdout 被重定向到管道时用的是本地代码页（GBK），
+    而本工具按 UTF-8 解码 —— 不统一的话中文会变成乱码（内容本身是好的，
+    但报告里就不可读了）。PYTHONIOENCODING 把子进程钉死在 UTF-8。
+    ⚠️ 只影响**本工具启动的子进程**；不影响人工直接跑 tools/build.py 的行为。
+    """
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
+def _run_project_tool(target: Path, argv_tail, timeout: int, python_exe, what: str) -> dict:
+    import sys
+
+    exe = python_exe or sys.executable
+    cmd = [exe] + list(argv_tail)
+    try:
+        r = subprocess.run(
+            cmd, cwd=str(target), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=timeout,
+            env=_child_env(),
+        )
+    except FileNotFoundError:
+        raise InitError("找不到 Python 解释器 %r —— 无法执行 %s。" % (exe, what))
+    except subprocess.TimeoutExpired:
+        raise InitError("%s 超时（%d 秒）—— 已中止。" % (what, timeout))
+    return {
+        "cmd": " ".join(cmd),
+        "cwd": str(target),
+        "exit_code": r.returncode,
+        "stdout": r.stdout,
+        "stderr": r.stderr,
+    }
+
+
+# L2 里那条**会再跑一次真实构建**的用例。L1 刚刚跑过（--skip-build 时更是明确
+# 要求不构建），所以显式 deselect 掉它 —— 这是**去重**，不是"跳过构建"：
+# 完整验证里至少有一次真实构建步骤，由 L1 承担。
+L2_DESELECT = "tests/test_build.py::test_build_passes"
+
+
+def run_build_l1(target: Path, python_exe=None, timeout: int = 1800) -> dict:
+    """L1：正式构建。四判据**全判**，其中判据 3 要求 min_compile_lines 已标定。
+
+    ⚠️ 不烧录、不接调试器、不开串口。
+    """
+    return _run_project_tool(target, ["tools/build.py"], timeout, python_exe, "L1 构建")
+
+
+def run_pytest_l2(target: Path, python_exe=None, timeout: int = 1800) -> dict:
+    """L2：无板测试（`pytest -m "not hardware"`，deselect 掉重复构建的那条）。
+
+    ⚠️ 不跑 hardware 用例：没有板子、没有串口、没有调试器。
+    """
+    return _run_project_tool(
+        target,
+        ["-m", "pytest", "-m", "not hardware", "--deselect", L2_DESELECT, "-q"],
+        timeout, python_exe, "L2 无板测试")
+
+
+# ============================================================================
+# 构建动作阈值：标定与写回（命令 `autolab calibrate`）
+# ============================================================================
+class CalibrationError(InitError):
+    """阈值无法标定 —— 此时 tools/project.cfg 必须**逐字节不变**。"""
+    exit_code = EXIT_CALIBRATION
+
+
+def threshold_for(n: int) -> int:
+    """稳定动作数 n -> 判据 3 的下界：**floor(2n/3)**（授权书定死的规则）。"""
+    return (2 * n) // 3
+
+
+def threshold_is_sane(n: int, thr: int) -> bool:
+    """阈值必须"真构建过得去、空转过不去"，且留有余量。
+
+    · n <= 0     —— 根本没有动作，谈不上标定
+    · thr < 1    —— 0 等于没有检查（1 条动作就能"通过"）
+    · thr >= n   —— 阈值等于/超过真实条数，动作数稍有抖动就误红
+    """
+    return n > 0 and 1 <= thr < n
+
+
+def threshold_is_missing(target: Path) -> bool:
+    """目标工程的 tools/project.cfg 里有没有**生效**的 min_compile_lines。
+
+    读不到文件也返回 True —— 调用方随后会因为"没有 project.cfg"明确失败。
+    """
+    p = Path(target) / "tools" / "project.cfg"
+    if not p.is_file():
+        return True
+    try:
+        text = p.read_bytes().decode("utf-8", "replace")
+    except OSError:
+        return True
+    return not _LIVE_THRESHOLD_RE.search(text)
+
+
+def parse_measure_line(stdout: str) -> dict:
+    """从 `tools/build.py --measure` 的输出里取**最后一条**协议行。
+
+    ⚠️ 取不到就失败，绝不"没读到就当成默认值" —— 那正是最危险的一种假绿。
+       最常见的原因：目标工程里的 tools/build.py 是**旧版**（不认识 --measure）。
+    """
+    hit = None
+    for line in stdout.splitlines():
+        if line.startswith(BUILD_MEASURE_PREFIX):
+            hit = line[len(BUILD_MEASURE_PREFIX):]
+    if hit is None:
+        raise CalibrationError(
+            "目标工程的 tools/build.py 没有输出测量行（前缀 %s）。\n"
+            "  最可能的原因：该文件的版本过旧，不支持 --measure。\n"
+            "  修法：重跑一次 `autolab init` 把平台工具同步进这个工程，再标定。"
+            % BUILD_MEASURE_PREFIX)
+    try:
+        data = json.loads(hit)
+    except ValueError as e:
+        raise CalibrationError("测量行不是合法 JSON：%r（%s）" % (hit[:200], e)) from None
+    if not isinstance(data, dict) or not isinstance(data.get("actions"), int) \
+            or "passed" not in data:
+        raise CalibrationError(
+            "测量行缺少 actions / passed 字段：%r\n"
+            "  适配器的测量协议变了而本工具没跟上？" % (hit[:200],))
+    return data
+
+
+def run_build_measure(target: Path, python_exe=None, timeout: int = 1800) -> dict:
+    """在目标工程里跑**一次真实全量软件构建**，只为测出动作条数。
+
+    ⚠️ 不烧录、不接调试器、不开串口。测量模式**只**放宽判据 3 的阈值，
+       退出码 / 0 Error 0 Warning / AXF 时间戳三条照常判定并由这里的
+       `exit_code` 与 `data["passed"]` 双重把关。
+    """
+    try:
+        res = _run_project_tool(
+            target, ["tools/build.py", "--measure"], timeout, python_exe,
+            "构建（测量模式）")
+    except InitError as e:
+        # 连构建都没跑起来（解释器不在 / 超时）—— 这是"标不出来"，不是"参数错"。
+        raise CalibrationError(str(e)) from None
+    res["data"] = parse_measure_line(res["stdout"])
+    return res
+
+
+def split_threshold_block(text: str):
+    """把 project.cfg 切成 (标记块之前, 标记块, 标记块之后)。
+
+    标记块不唯一就失败 —— 本工具**不做猜测式改写**。
+    """
+    ms = list(_CFG_BLOCK_RE.finditer(text))
+    if len(ms) != 1:
+        raise CalibrationError(
+            "tools/project.cfg 里的阈值标记块有 %d 个（期望恰好 1 个）：%s … %s\n"
+            "  本工具不做猜测式改写。请把该文件恢复成 `autolab init` 生成的样子"
+            "（或手工把这两个标记补回来）后重试。" % (len(ms), CFG_BLOCK_BEGIN, CFG_BLOCK_END))
+    return text[:ms[0].start()], ms[0].group(0), text[ms[0].end():]
+
+
+def render_threshold_block(thr: int, n: int, runs, target: Path, generated_at: str) -> str:
+    """标定后的阈值标记块。写清**取值来源**，不写"经验值"。"""
+    target = Path(target)
+
+    def rel(p):
+        try:
+            return Path(p).resolve().relative_to(target.resolve()).as_posix()
+        except (ValueError, TypeError):
+            # 不在工程内（例如用户改了输出目录）——原样给出绝对路径，别编。
+            return str(p)
+
+    L = [
+        CFG_BLOCK_BEGIN,
+        "# 四判据之三的阈值：构建日志里 compiling/assembling/linking 的行数下界。",
+        "# 作用：防\"增量空转却返回 0\"这种假 0。",
+        "#",
+        "# 由 `python tools/autolab.py calibrate` 于 %s 实测标定：" % generated_at,
+        "#   连续两次**真实全量构建**的动作数均为 **%d** 条，" % n,
+        "#   按 floor(2/3 × %d) = **%d** 取为下界。" % (n, thr),
+    ]
+    for r in runs:
+        L.append("#   · 第 %s 次：%s 条，退出码 %s，日志 %s"
+                 % (r.get("round"), r.get("actions"), r.get("exit_code"),
+                    rel(r.get("log") or "")))
+    L += [
+        "#",
+        "# ⚠️ 阈值只防\"空转假 0\"，**不代表**\"真实增量构建已验证\" ——",
+        "#    本工程用 CLI 构建时每次都全量重编，\"空转\"根本没被构造出来过。",
+        "# ⚠️ 换工程 / 换工具链 / 改动源码集之后再构建，都要重新标定。",
+        "min_compile_lines = %d" % thr,
+        CFG_BLOCK_END + " ---",
+    ]
+    # 结尾必须带换行：`split_threshold_block()` 切出来的块含行尾的 `\n`，
+    # 两侧一致才能保证"改写只发生在块内"这条校验真的可比。
+    return "\n".join(L) + "\n"
+
+
+def _run_summary(r: dict) -> dict:
+    d = r["data"]
+    return {
+        "round": r.get("round"),
+        "exit_code": r["exit_code"],
+        "cmd": r["cmd"],
+        "actions": d.get("actions"),
+        "errors": d.get("errors"),
+        "warnings": d.get("warnings"),
+        "axf_updated": d.get("axf_updated"),
+        "passed": d.get("passed"),
+        "log": d.get("log", ""),
+    }
+
+
+def _tail(text: str, n: int = 25) -> str:
+    lines = text.rstrip("\n").splitlines()
+    return "\n".join("      | " + x for x in lines[-n:])
+
+
+def calibrate_threshold(target: Path, python_exe=None, timeout: int = 1800) -> dict:
+    """两次真实全量构建 -> 稳定动作数 -> floor(2/3) -> 写回 tools/project.cfg。
+
+    只有**全部**通过才写文件；任何失败路径都抛 CalibrationError（退出码 5），
+    且 tools/project.cfg **逐字节不变**（写盘是最后一步，之前一个字节都没动过）。
+    """
+    target = Path(target)
+    cfg_path = target / "tools" / "project.cfg"
+    build_py = target / "tools" / "build.py"
+    if not cfg_path.is_file():
+        raise InitError("目标工程里没有 tools/project.cfg：%s\n"
+                        "  这不是一个已接入 Autolab 的工程。" % cfg_path)
+    if not build_py.is_file():
+        raise InitError("目标工程里没有 tools/build.py：%s\n"
+                        "  这不是一个已接入 Autolab 的工程。" % build_py)
+
+    original = cfg_path.read_bytes()
+    text = original.decode("utf-8")
+    pre, _old_block, suf = split_threshold_block(text)
+    for where, part in (("标记块之前", pre), ("标记块之后", suf)):
+        if _LIVE_THRESHOLD_RE.search(part):
+            raise CalibrationError(
+                "tools/project.cfg 的%s已经有生效的 min_compile_lines —— 拒绝改写\n"
+                "  （改下去会变成重复键，configparser 会直接报错）。" % where)
+
+    runs = []
+    for i in (1, 2):
+        r = run_build_measure(target, python_exe, timeout)
+        r["round"] = i
+        runs.append(r)
+        print("  [%d/2] 全量构建：%s 条动作，退出码 %s，日志 %s"
+              % (i, r["data"].get("actions"), r["exit_code"], r["data"].get("log")))
+
+    # ---- 非动作数判据 + 计数稳定性：任一不过就不写 ----
+    reasons = []
+    for r in runs:
+        d = r["data"]
+        if r["exit_code"] != 0 or d.get("passed") is not True:
+            reasons.append("第 %s 次构建未通过非阈值判据（子进程退出码 %s，"
+                           "0 Error/0 Warning 与产物时间戳见下）" % (r["round"], r["exit_code"]))
+            reasons.append(_tail(r["stdout"]))
+        elif d.get("axf_updated") is not True:
+            reasons.append("第 %s 次构建后产物 .axf 时间戳未更新（%s）"
+                           % (r["round"], d.get("axf")))
+
+    n1, n2 = runs[0]["data"].get("actions"), runs[1]["data"].get("actions")
+    if n1 is None or n2 is None:
+        reasons.append("构建日志里没数出动作条数 —— 日志无效")
+    else:
+        if n1 <= 0 or n2 <= 0:
+            reasons.append("动作数为 %s / %s —— 这次构建其实什么都没编" % (n1, n2))
+        elif n1 != n2:
+            reasons.append("两次动作数不同（%s vs %s）—— 不可复现，拒绝标定"
+                           "（可能是并行度/依赖图不稳定，或多进程同时在编同一工程）"
+                           % (n1, n2))
+
+    if reasons:
+        # 自证：走到这里一个字节都还没写过。
+        assert cfg_path.read_bytes() == original, "标定失败路径竟改动过 project.cfg"
+        raise CalibrationError(
+            "阈值标定未能完成，tools/project.cfg **逐字节未改动**。\n"
+            "  原因：\n%s\n"
+            "  两次构建的实测值：\n%s"
+            % ("\n".join("    · " + x for x in reasons),
+               "\n".join("    · 第 %s 次：%s 条，退出码 %s，日志 %s"
+                         % (r["round"], r["data"].get("actions"), r["exit_code"],
+                            r["data"].get("log")) for r in runs)))
+
+    n = n1
+    thr = threshold_for(n)
+    if not threshold_is_sane(n, thr):
+        assert cfg_path.read_bytes() == original, "标定失败路径竟改动过 project.cfg"
+        raise CalibrationError(
+            "按 floor(2/3 × %d) = %d 算出的阈值不合理，**不写入**。\n"
+            "  阈值必须满足 1 <= thr < 动作数（等于动作数就没有余量）。\n"
+            "  这一般说明这个工程的动作数太少（< 3 条），阈值起不到作用 ——"
+            " 请人工确认构建是否真的在编东西。" % (n, thr))
+
+    generated_at = datetime.datetime.now().replace(microsecond=0).isoformat()
+    summaries = [_run_summary(r) for r in runs]
+    new_text = pre + render_threshold_block(thr, n, summaries, target, generated_at) + suf
+
+    # ---- 校验：改写只发生在标记块内，其余逐字符不变 ----
+    npre, nblock, nsuf = split_threshold_block(new_text)
+    if (npre, nsuf) != (pre, suf):
+        raise CalibrationError("内部错误：改写跑到了标记块之外，**未写入**。")
+    if not re.search(r"(?m)^min_compile_lines\s*=\s*%d\s*$" % thr, nblock):
+        raise CalibrationError("内部错误：新标记块里读不回阈值 %d，**未写入**。" % thr)
+
+    cfg_path.write_bytes(new_text.encode("utf-8"))
+    if cfg_path.read_bytes() != new_text.encode("utf-8"):
+        raise CalibrationError("写入后回读不一致：%s —— 请人工核对。" % cfg_path)
+
+    return {
+        "status": "PASS",
+        "rule": "floor(2/3 × 稳定动作数)",
+        "actions": [n1, n2],
+        "actions_stable": True,
+        "threshold": thr,
+        "written": True,
+        "cfg": "tools/project.cfg",
+        "generated_at": generated_at,
+        "runs": summaries,
+    }
+
+
+def newest_build_log(target: Path) -> str:
+    """tools/build_logs/ 里最近一次的构建日志（相对工程根）；没有则空串。"""
+    target = Path(target)
+    d = target / "tools" / "build_logs"
+    if not d.is_dir():
+        return ""
+    logs = [p for p in d.glob("build_*.log") if p.is_file()]
+    if not logs:
+        return ""
+    newest = max(logs, key=lambda p: p.stat().st_mtime)
+    try:
+        return newest.relative_to(target).as_posix()
+    except ValueError:
+        return str(newest)
+
+
+# ============================================================================
 # 报告
 # ============================================================================
 def build_report(plan: Plan, collisions, written, skipped, checks, opts) -> dict:
@@ -1365,7 +1761,8 @@ def build_report(plan: Plan, collisions, written, skipped, checks, opts) -> dict
     different = [c.dst_rel for c in collisions if c.kind == "different"]
     return {
         "tool": "autolab init",
-        "report_version": 1,
+        # v1 -> v2：checks 里的 L1/L2 由字符串改成结构化 dict，并新增 calibration 一节
+        "report_version": 2,
         "generated_at": opts.get("generated_at", ""),
         "dry_run": bool(opts.get("dry_run")),
         "forced": bool(opts.get("force")),
@@ -1422,7 +1819,9 @@ def report_markdown(rep: dict, plan: Plan, backup_note: str = "") -> str:
     A("# autolab init 报告 —— %s" % rep["project_name"])
     A("")
     A("> 本文件由 `autolab init` 自动生成，记录**这一次**初始化的来龙去脉。")
-    A("> ⚠️ `NOT RUN` 不等于 `PASS` —— 本阶段只跑 L0，L1/L2/L3 一律是 `NOT RUN`。")
+    A("> ⚠️ `NOT RUN` / `SKIPPED` **都不等于** `PASS` —— 它们各自说明了为什么没跑。")
+    A("> ⚠️ **\"初始化成功\"**（文件写对了）与**\"完整软件验证成功\"**（L0–L2 全绿）"
+      "是两件事，本报告分列，不合并表述。")
     A("")
     A("- 生成时间：`%s`" % rep["generated_at"])
     A("- 目标工程：`%s`" % rep["target"])
@@ -1495,36 +1894,92 @@ def report_markdown(rep: dict, plan: Plan, backup_note: str = "") -> str:
     A("")
     A("## 四、初始化后检查")
     A("")
-    L0 = rep["checks"].get("L0") or {}
-    A("### L0 环境预检 —— `%s`" % L0.get("status", "?"))
+    checks = rep["checks"]
+    L0 = checks.get("L0") or {}
+    cal = checks.get("calibration") or {}
+    L1 = checks.get("L1") or {}
+    L2 = checks.get("L2") or {}
+    L3 = checks.get("L3") or {}
+
+    def brief(c, extra=""):
+        if c.get("status") in ("PASS", "FAIL") and c.get("exit_code") is not None:
+            return "退出码 %s%s" % (c["exit_code"], extra)
+        return c.get("reason", "")
+
+    A("| 层 | 状态 | 说明 |")
+    A("|---|---|---|")
+    A("| L0 环境自检 | **%s** | %s |"
+      % (L0.get("status", "?"), brief(L0)))
+    if cal.get("status") == "PASS":
+        cal_note = ("两次均为 **%s** 条动作，`%s` = **%s**，已写入 `%s`"
+                    % (cal["actions"][0], cal["rule"], cal["threshold"], cal["cfg"]))
+    else:
+        cal_note = cal.get("reason", "")
+    A("| 构建阈值标定 | **%s** | %s |" % (cal.get("status", "?"), cal_note.replace("\n", "<br>")))
+    A("| L1 构建 | **%s** | %s |"
+      % (L1.get("status", "?"), brief(L1, "，日志 `%s`" % L1.get("log", ""))))
+    A("| L2 无板测试 | **%s** | %s |" % (L2.get("status", "?"), brief(L2)))
+    A("| L3 真机 HIL | **%s** | %s |" % (L3.get("status", "?"), brief(L3)))
     A("")
-    if L0.get("status") == "SKIPPED":
-        A("未执行（`--no-run-checks`）。")
-    elif L0:
+    A("> `NOT RUN`（没跑）与 `SKIPPED`（本轮不需要跑）**都不是** `PASS`。")
+    A("")
+
+    def layer_output(title, c):
+        A("### %s —— `%s`" % (title, c.get("status", "?")))
+        A("")
+        if c.get("status") not in ("PASS", "FAIL"):
+            A("未执行：%s" % c.get("reason", "（无说明）"))
+            A("")
+            return
         A("```")
-        A("$ %s" % L0.get("cmd", ""))
-        A("（cwd = %s）" % L0.get("cwd", ""))
-        A("退出码 = %s" % L0.get("exit_code"))
+        A("$ %s" % c.get("cmd", ""))
+        A("（cwd = %s）" % c.get("cwd", ""))
+        A("退出码 = %s" % c.get("exit_code"))
         A("```")
         A("")
         A("原始输出：")
         A("")
         A("```text")
-        A(L0.get("stdout", "").rstrip("\n"))
-        if L0.get("stderr", "").strip():
+        A((c.get("stdout") or "").rstrip("\n"))
+        if (c.get("stderr") or "").strip():
             A("---- stderr ----")
-            A(L0["stderr"].rstrip("\n"))
+            A(c["stderr"].rstrip("\n"))
+        A("```")
+        A("")
+
+    layer_output("L0 环境预检", L0)
+
+    A("### 构建阈值标定 —— `%s`" % cal.get("status", "?"))
+    A("")
+    if cal.get("status") == "PASS":
+        A("| 轮次 | 动作数 | 退出码 | 产物时间戳已更新 | 日志 |")
+        A("|---|---|---|---|---|")
+        for r in cal["runs"]:
+            A("| 第 %s 次 | %s | %s | %s | `%s` |"
+              % (r.get("round"), r.get("actions"), r.get("exit_code"),
+                 "是" if r.get("axf_updated") else "**否**", r.get("log", "")))
+        A("")
+        A("- 两次动作数一致：`%s` = `%s`（稳定）" % (cal["actions"][0], cal["actions"][1]))
+        A("- 取值规则：`%s`，即 floor(2/3 × %s) = **%s**"
+          % (cal["rule"], cal["actions"][0], cal["threshold"]))
+        A("- 写入 `%s`：**已写入**（只改阈值标记块，其余逐字节不变）" % cal["cfg"])
+        A("- 标定时间：`%s`" % cal.get("generated_at", ""))
+        A("")
+        A("> ⚠️ 阈值只防\"空转假 0\"，**不代表**\"真实增量构建已验证\"。")
+    elif cal.get("status") in ("NOT RUN", "SKIPPED", None, "?"):
+        A("未执行：%s" % cal.get("reason", "（无说明）"))
+    else:
+        A("失败原因（`tools/project.cfg` **逐字节未改动**）：")
+        A("")
+        A("```text")
+        A(cal.get("reason", ""))
         A("```")
     A("")
-    A("### L1 / L2 / L3")
-    A("")
-    A("| 层 | 状态 | 原因 |")
-    A("|---|---|---|")
-    A("| L1 构建 | **NOT RUN** | 本阶段不执行构建验证（`min_compile_lines` 尚未标定，"
-      "刻意的可见失败） |")
-    A("| L2 无板测试 | **NOT RUN** | 同上 —— 未构建则无 PASS 日志，镜像检查无从谈起 |")
-    A("| L3 真机 HIL | **NOT RUN** | 未获人工授权；且 `[serial]` 契约尚未确定 |")
-    A("")
+
+    layer_output("L1 构建", L1)
+    layer_output("L2 无板测试（不含硬件用例）", L2)
+    layer_output("L3 真机 HIL", L3)
+
     if backup_note:
         A("## 五、覆盖前备份")
         A("")
@@ -1536,9 +1991,17 @@ def report_markdown(rep: dict, plan: Plan, backup_note: str = "") -> str:
     A("")
     A("1. 打开 `CLAUDE.md`，填第三节「本工程的坑」。")
     A("2. 核对 `tools/project.cfg` 里 `[image] required_symbols`（现只有 `main`）。")
-    A("3. 跑一次真实全量构建，按 `[build] min_compile_lines` 一节的步骤标定阈值。")
-    A("4. 标定后跑 `python tools/build.py`（L1）与 `pytest -m \"not hardware\"`（L2）。")
-    A("5. L3 需要先实现固件的启动标记与软复位，并确认串口硬件。")
+    if cal.get("status") == "PASS":
+        A("3. 阈值已标定（`min_compile_lines = %s`）；要重标就跑 "
+          "`python tools/autolab.py calibrate --target <本工程根>`。"
+          % cal["threshold"])
+    else:
+        A("3. 标定阈值：`python tools/autolab.py calibrate --target <本工程根>`"
+          "（或 `autolab init --run-checks` 自动完成）。")
+    A("4. 完整软件验证：`autolab init --run-checks`，"
+      "或分开跑 `python tools/build.py`（L1）与 "
+      "`pytest -m \"not hardware\"`（L2）。")
+    A("5. L3 需要先实现固件的启动标记与软复位，并确认串口硬件 —— 且需人工授权。")
     A("")
     return "\n".join(L)
 

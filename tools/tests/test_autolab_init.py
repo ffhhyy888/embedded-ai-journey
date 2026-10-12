@@ -892,8 +892,12 @@ def test_report_records_source_hashes_and_l0_result(tmp_path, monkeypatch):
     assert len(rep["generated_from_templates"]) == 6
     assert rep["checks"]["L0"]["status"] == "PASS"
     assert rep["checks"]["L0"]["exit_code"] == 0
-    assert rep["checks"]["L1"] == "NOT RUN"
-    assert rep["checks"]["L2"] == "NOT RUN"
+    # v2：L1/L2 由裸字符串改成结构化 dict（要记退出码、日志、cmd）
+    assert rep["checks"]["L1"]["status"] == "NOT RUN"
+    assert rep["checks"]["L2"]["status"] == "NOT RUN"
+    assert rep["checks"]["calibration"]["status"] == "NOT RUN"
+    assert rep["checks"]["L3"]["status"] == "NOT RUN"
+    assert rep["report_version"] == 2
     assert rep["warnings"]
 
     md = (proj / "docs" / "AUTOLAB_INIT.md").read_text(encoding="utf-8")
@@ -920,7 +924,14 @@ def test_no_run_checks_skips_preflight_entirely(tmp_path, monkeypatch):
     proj = make_cube(tmp_path / "proj", name="proj")
     assert run_init(proj, ["--project-name", "proj"]) == 0
     rep = json.loads((proj / "tools" / "autolab_init.json").read_text(encoding="utf-8"))
-    assert rep["checks"]["L0"]["status"] == "SKIPPED"
+    # 跳过必须记成 `NOT RUN`（**不是** PASS，也不再是更含糊的 SKIPPED）——
+    # 用户选择不跑，不等于那些检查通过了。
+    assert rep["checks"]["L0"]["status"] == "NOT RUN"
+    for k in ("L1", "L2", "calibration"):
+        assert rep["checks"][k]["status"] == "NOT RUN"
+        assert "--no-run-checks" in rep["checks"][k]["reason"]
+    md = (proj / "docs" / "AUTOLAB_INIT.md").read_text(encoding="utf-8")
+    assert "**NOT RUN**" in md
 
 
 # ============================================================================
@@ -1002,3 +1013,493 @@ def test_platform_repo_is_never_written_to(tmp_path):
     assert set(after["files"]) == set(before["files"]), "平台文件清单变了"
     changed = {k for k in before["files"] if after["files"][k] != before["files"][k]}
     assert changed == set(), "init 改写了平台文件：%s" % (changed,)
+
+
+# ============================================================================
+# 15. 阶段 2：构建阈值标定（`autolab calibrate`）
+#
+# ⚠️ 这里**不起 Keil、不碰硬件**：`run_build_measure` 被换成受控假实现。
+#    真实工具链的证据只能由端到端那一轮给。本节的职责是钉住**判定逻辑**：
+#    什么情况该写阈值、什么情况**必须不写**。
+# ============================================================================
+def fake_measure(counts, exit_code=0, errors=0, warnings=0, axf_updated=True,
+                 log="tools/build_logs/cal_fake.log"):
+    """伪造 `S.run_build_measure`：按 counts 依次给出每次的动作条数。
+
+    `passed` 的算法**照抄真实 build.py 的语义**（判据 1/2/4 的合取；判据 3 在
+    测量模式下不判）—— 否则"假实现比真实现宽松"会让这些用例失去意义。
+    """
+    seq = list(counts)
+    state = {"i": 0}
+
+    def f(target, python_exe=None, timeout=1800):
+        n = seq[min(state["i"], len(seq) - 1)]
+        state["i"] += 1
+        return {
+            "cmd": "python tools/build.py --measure", "cwd": str(target),
+            "exit_code": exit_code, "stdout": "=== Build（测量模式）===\n",
+            "stderr": "",
+            "data": {
+                "actions": n, "threshold_judged": False,
+                "errors": errors, "warnings": warnings,
+                "uvision_exit_code": exit_code, "axf": "fake.axf",
+                "axf_updated": axf_updated, "log": log,
+                "passed": bool(exit_code == 0 and errors == 0 and warnings == 0
+                               and axf_updated),
+            },
+        }
+    return f
+
+
+def a_project(tmp_path):
+    """造一个已接入 Autolab 的工程（含 tools/project.cfg 与标记块）。"""
+    proj = make_cube(tmp_path / "proj", name="proj")
+    assert run_init(proj, ["--project-name", "proj"]) == 0
+    return proj
+
+
+def cfg_bytes(proj):
+    return (proj / "tools" / "project.cfg").read_bytes()
+
+
+def live_threshold(proj):
+    """读出生效的阈值；没有则 None。"""
+    m = re.search(r"(?m)^min_compile_lines\s*=\s*(\d+)\s*$",
+                  (proj / "tools" / "project.cfg").read_text(encoding="utf-8"))
+    return int(m.group(1)) if m else None
+
+
+def run_calibrate(proj, expect_exit=None):
+    code = autolab.main(["calibrate", "--target", str(proj)])
+    if expect_exit is not None:
+        assert code == expect_exit, "期望退出码 %s，实际 %s" % (expect_exit, code)
+    return code
+
+
+def test_init_leaves_the_threshold_uncalibrated_but_marked(tmp_path):
+    """init 生成的文件里：阈值仍是注释，且**标记块恰好一个**（标定靠它定位）。"""
+    proj = a_project(tmp_path)
+    assert live_threshold(proj) is None
+    text = (proj / "tools" / "project.cfg").read_text(encoding="utf-8")
+    _, block, _ = S.split_threshold_block(text)
+    assert "# min_compile_lines = <待标定>" in block
+    assert block.startswith(S.CFG_BLOCK_BEGIN)
+    assert S.CFG_BLOCK_END in block
+    assert "calibrate" in block and "退出码 5" in block
+
+
+def test_threshold_rule_is_floor_two_thirds():
+    """授权书定死的规则：稳定动作数的 2/3 向下取整。24 -> 16。"""
+    assert S.threshold_for(24) == 16
+    assert S.threshold_for(56) == 37          # SDIO_test 参考工程的 56 条
+    assert S.threshold_for(3) == 2
+    assert S.threshold_for(2) == 1
+    # n=1 -> 0：阈值 0 等于没有检查 -> 必须判"不合理"
+    assert S.threshold_for(1) == 0
+    assert not S.threshold_is_sane(1, 0)
+    assert S.threshold_is_sane(2, 1)
+    assert S.threshold_is_sane(24, 16)
+    assert not S.threshold_is_sane(24, 24)    # 等于真实条数：没有余量
+    assert not S.threshold_is_sane(0, 0)      # 没有动作可言
+    assert not S.threshold_is_sane(-3, 0)
+
+
+def test_calibrate_writes_the_threshold_when_both_counts_agree(tmp_path, monkeypatch):
+    monkeypatch.setattr(S, "run_build_measure", fake_measure([24, 24]))
+    proj = a_project(tmp_path)
+    before = cfg_bytes(proj)
+
+    assert run_calibrate(proj, expect_exit=0) == 0
+
+    assert live_threshold(proj) == 16, "两次均为 24 -> floor(2/3 × 24) = 16"
+    after = cfg_bytes(proj)
+    assert after != before
+    # 改写**只**发生在标记块内：块外必须逐字节不变
+    pre_b, blk_b, suf_b = S.split_threshold_block(before.decode("utf-8"))
+    pre_a, blk_a, suf_a = S.split_threshold_block(after.decode("utf-8"))
+    assert (pre_b, suf_b) == (pre_a, suf_a), "标定改动了标记块之外的内容"
+    assert blk_b != blk_a
+    # 块里留下了可追溯的实测依据，而不是一个孤零零的数字
+    assert "第 1 次" in blk_a and "第 2 次" in blk_a
+    assert "floor(2/3 × 24) = **16**" in blk_a
+    assert "不代表" in blk_a and "增量" in blk_a      # 不许声称增量已验证
+    assert "尚未标定" not in blk_a                    # 旧说明被整块换掉，不留自相矛盾
+
+
+def test_calibrate_writes_a_report_of_the_measured_values(tmp_path, monkeypatch):
+    monkeypatch.setattr(S, "run_build_measure", fake_measure([30, 30]))
+    proj = a_project(tmp_path)
+    res = S.calibrate_threshold(proj)
+    assert res["status"] == "PASS"
+    assert res["actions"] == [30, 30]
+    assert res["actions_stable"] is True
+    assert res["threshold"] == 20
+    assert res["written"] is True
+    assert [r["actions"] for r in res["runs"]] == [30, 30]
+    assert [r["round"] for r in res["runs"]] == [1, 2]
+    assert all(r["exit_code"] == 0 for r in res["runs"])
+    assert all(r["log"] for r in res["runs"])
+
+
+@pytest.mark.parametrize("label, kwargs", [
+    ("两次计数不同", dict(counts=[24, 23])),
+    ("构建失败（退出码 2）", dict(counts=[24, 24], exit_code=2)),
+    ("有编译错误（1 Error）", dict(counts=[24, 24], errors=1)),
+    ("有警告（1 Warning）", dict(counts=[24, 24], warnings=1)),
+    ("日志里没有统计行（无效日志）", dict(counts=[24, 24], warnings=None)),
+    ("产物 .axf 时间戳未更新", dict(counts=[24, 24], axf_updated=False)),
+    ("动作数为 0（其实什么都没编）", dict(counts=[0, 0])),
+    ("动作数为负（解析异常）", dict(counts=[-1, -1])),
+    ("动作数只有 1 条 -> floor(2/3) = 0，不合理", dict(counts=[1, 1])),
+])
+def test_calibrate_never_writes_when_anything_is_off(tmp_path, monkeypatch,
+                                                     label, kwargs):
+    """⚠️ 核心边界：这些情形**一个都不许**写阈值，必须退出码 5。"""
+    counts = kwargs.pop("counts")
+    if kwargs.get("warnings") is None:
+        # "无效日志"：统计行读不出来 -> warnings/errors 都是 None
+        kwargs["warnings"] = None
+        kwargs["errors"] = None
+    monkeypatch.setattr(S, "run_build_measure", fake_measure(counts, **kwargs))
+    proj = a_project(tmp_path)
+    before = cfg_bytes(proj)
+
+    assert run_calibrate(proj, expect_exit=S.EXIT_CALIBRATION) == 5
+    assert cfg_bytes(proj) == before, "%s：project.cfg 被改动了" % label
+    assert live_threshold(proj) is None
+
+
+def test_calibrate_exit_5_is_distinct_from_exit_4(tmp_path, monkeypatch):
+    """标定失败是 5（配置一字未动），不是 4（文件已写但检查没过）—— 不混为一谈。"""
+    monkeypatch.setattr(S, "run_build_measure", fake_measure([24, 25]))
+    proj = a_project(tmp_path)
+    assert run_calibrate(proj) == S.EXIT_CALIBRATION == 5
+    assert S.EXIT_CALIBRATION != S.EXIT_CHECKS_FAILED
+
+
+@pytest.mark.parametrize("setup", ["empty", "missing"])
+def test_calibrate_refuses_a_project_that_was_never_initialised(tmp_path, setup):
+    """不是 Autolab 工程 -> 退出码 2（参数/配置错），不是 5，也不写任何文件。"""
+    target = tmp_path / "empty"
+    if setup == "empty":
+        target.mkdir()
+    code = autolab.main(["calibrate", "--target", str(target)])
+    assert code == S.EXIT_INPUT
+    assert not (target / "tools" / "project.cfg").exists()
+
+
+def test_calibrate_fails_loudly_when_build_py_cannot_measure(tmp_path, monkeypatch):
+    """目标工程的 tools/build.py 是旧版（不认 --measure）-> 明确失败，不猜、不写。"""
+    proj = a_project(tmp_path)
+    before = cfg_bytes(proj)
+
+    def old_build(target, python_exe=None, timeout=1800):
+        res = {"cmd": "python tools/build.py --measure", "cwd": str(target),
+               "exit_code": 0, "stdout": "=== Build ===\n结果: PASS\n", "stderr": ""}
+        res["data"] = S.parse_measure_line(res["stdout"])    # 旧版没有测量行 -> 抛
+        return res
+    monkeypatch.setattr(S, "run_build_measure", old_build)
+
+    with pytest.raises(S.CalibrationError) as ei:
+        S.calibrate_threshold(proj)
+    assert "--measure" in str(ei.value) or "测量行" in str(ei.value)
+    assert cfg_bytes(proj) == before
+    assert live_threshold(proj) is None
+
+
+@pytest.mark.parametrize("stdout", [
+    "",                                              # 什么都没有
+    "=== Build ===\n结果: PASS\n",                    # 旧版 build.py 的输出
+    S.BUILD_MEASURE_PREFIX + "{not json",            # 协议行坏了
+    S.BUILD_MEASURE_PREFIX + '{"actions": "24", "passed": true}',   # actions 不是整数
+    S.BUILD_MEASURE_PREFIX + '{"actions": 24}',      # 少了 passed
+    S.BUILD_MEASURE_PREFIX + '[1, 2]',               # 不是对象
+])
+def test_measure_line_parser_never_invents_data(stdout):
+    """读不到 / 读坏了都必须失败 —— 绝不"没读到就当默认值"。"""
+    with pytest.raises(S.CalibrationError):
+        S.parse_measure_line(stdout)
+
+
+def test_measure_line_parser_takes_the_last_one():
+    good = S.BUILD_MEASURE_PREFIX + '{"actions": 24, "passed": true}'
+    data = S.parse_measure_line("x\n" + good + "\ny\n")
+    assert data["actions"] == 24 and data["passed"] is True
+
+
+def test_calibrate_requires_exactly_one_marker_block(tmp_path):
+    proj = a_project(tmp_path)
+    p = proj / "tools" / "project.cfg"
+    p.write_text(p.read_text(encoding="utf-8").replace(S.CFG_BLOCK_END, "", 1),
+                 encoding="utf-8")
+    before = cfg_bytes(proj)
+    assert autolab.main(["calibrate", "--target", str(proj)]) == S.EXIT_CALIBRATION
+    assert cfg_bytes(proj) == before
+
+
+def test_calibrate_refuses_when_a_live_threshold_exists_outside_the_block(tmp_path):
+    """标记块外已经有一处生效的阈值 -> 改下去会变成重复键。必须拒绝，不许硬写。"""
+    proj = a_project(tmp_path)
+    p = proj / "tools" / "project.cfg"
+    p.write_text(p.read_text(encoding="utf-8") + "\nmin_compile_lines = 7\n",
+                 encoding="utf-8")
+    before = cfg_bytes(proj)
+    assert autolab.main(["calibrate", "--target", str(proj)]) == S.EXIT_CALIBRATION
+    assert cfg_bytes(proj) == before
+
+
+def test_calibrate_is_repeatable_and_only_rewrites_its_own_block(tmp_path, monkeypatch):
+    proj = a_project(tmp_path)
+    monkeypatch.setattr(S, "run_build_measure", fake_measure([24, 24]))
+    assert run_calibrate(proj) == 0
+    assert live_threshold(proj) == 16
+    once = cfg_bytes(proj)
+    monkeypatch.setattr(S, "run_build_measure", fake_measure([30, 30]))
+    assert run_calibrate(proj) == 0
+    assert live_threshold(proj) == 20
+    pre_1, _, suf_1 = S.split_threshold_block(once.decode("utf-8"))
+    pre_2, _, suf_2 = S.split_threshold_block(cfg_bytes(proj).decode("utf-8"))
+    assert (pre_1, suf_1) == (pre_2, suf_2)
+
+
+def test_threshold_is_missing_reads_the_real_file(tmp_path):
+    proj = a_project(tmp_path)
+    assert S.threshold_is_missing(proj) is True
+    p = proj / "tools" / "project.cfg"
+    p.write_text(p.read_text(encoding="utf-8").replace(
+        "# min_compile_lines = <待标定>", "min_compile_lines = 16"), encoding="utf-8")
+    assert S.threshold_is_missing(proj) is False
+
+
+# ============================================================================
+# 16. 阶段 2：`init --run-checks` 的 L0–L2 闭环
+# ============================================================================
+def stub_layers(monkeypatch, calls, l0=0, measure=(24, 24), l1=0, l2=0,
+                calib_error=None, threshold_present=False):
+    """把四个步骤换成记账用的桩（**不起 Keil、不跑 pytest**），按调用顺序记名字。"""
+    def preflight(target, python_exe=None, timeout=300):
+        calls.append("L0")
+        return {"cmd": "python tools/preflight.py", "cwd": str(target),
+                "exit_code": l0, "stdout": "[ OK ] stub\n", "stderr": ""}
+    monkeypatch.setattr(S, "run_preflight", preflight)
+
+    def calibrate(target, python_exe=None, timeout=1800):
+        calls.append("calibrate")
+        if calib_error:
+            raise S.CalibrationError(calib_error)
+        counts = list(measure)
+        return {"status": "PASS", "rule": "floor(2/3 × 稳定动作数)",
+                "actions": counts, "actions_stable": True,
+                "threshold": S.threshold_for(counts[0]), "written": True,
+                "cfg": "tools/project.cfg",
+                "generated_at": "2026-10-12T00:00:00",
+                "runs": [{"round": i + 1, "exit_code": 0, "actions": n,
+                          "errors": 0, "warnings": 0, "axf_updated": True,
+                          "passed": True,
+                          "log": "tools/build_logs/cal_%d.log" % (i + 1)}
+                         for i, n in enumerate(counts)]}
+    monkeypatch.setattr(S, "calibrate_threshold", calibrate)
+    monkeypatch.setattr(S, "threshold_is_missing",
+                        lambda target: not threshold_present)
+
+    def build(target, python_exe=None, timeout=1800):
+        calls.append("L1")
+        return {"cmd": "python tools/build.py", "cwd": str(target),
+                "exit_code": l1, "stderr": "",
+                "stdout": "=== Build ===\n结果: %s\n"
+                          % ("PASS" if l1 == 0 else "FAIL")}
+    monkeypatch.setattr(S, "run_build_l1", build)
+
+    def pytest_l2(target, python_exe=None, timeout=1800):
+        calls.append("L2")
+        return {"cmd": "python -m pytest -m 'not hardware' --deselect ... -q",
+                "cwd": str(target), "exit_code": l2,
+                "stdout": "fake pytest\n", "stderr": ""}
+    monkeypatch.setattr(S, "run_pytest_l2", pytest_l2)
+    return calls
+
+
+def run_checks_init(proj, extra=(), expect_exit=None):
+    argv = ["init", "--family", FAMILY, "--target", str(proj),
+            "--platform", str(PLAT["dir"]), "--project-name", "proj",
+            "--force"] + list(extra)
+    code = autolab.main(argv)
+    if expect_exit is not None:
+        assert code == expect_exit, "期望退出码 %s，实际 %s" % (expect_exit, code)
+    return code
+
+
+def report_of(proj):
+    return json.loads((proj / "tools" / "autolab_init.json").read_text(encoding="utf-8"))
+
+
+def test_run_checks_runs_l0_calibration_l1_l2_in_that_order(tmp_path, monkeypatch):
+    """授权书定死的顺序：L0 -> 阈值标定 -> L1 -> L2。"""
+    calls = stub_layers(monkeypatch, [])
+    proj = make_cube(tmp_path / "proj", name="proj")
+    assert run_checks_init(proj, ["--run-checks"], expect_exit=0) == 0
+    assert calls == ["L0", "calibrate", "L1", "L2"], calls
+
+    rep = report_of(proj)
+    assert rep["checks"]["L0"]["status"] == "PASS"
+    assert rep["checks"]["calibration"]["status"] == "PASS"
+    assert rep["checks"]["calibration"]["threshold"] == 16
+    assert rep["checks"]["L1"]["status"] == "PASS"
+    assert rep["checks"]["L2"]["status"] == "PASS"
+    assert rep["checks"]["L3"]["status"] == "NOT RUN"
+
+
+def test_calibration_failure_stops_before_l1_and_l2(tmp_path, monkeypatch):
+    calls = stub_layers(monkeypatch, [], calib_error="两次动作数不同（24 vs 23）")
+    proj = make_cube(tmp_path / "proj", name="proj")
+    assert run_checks_init(proj, ["--run-checks"],
+                           expect_exit=S.EXIT_CALIBRATION) == 5
+    assert calls == ["L0", "calibrate"], calls
+
+    rep = report_of(proj)
+    assert rep["checks"]["calibration"]["status"] == "FAIL"
+    assert "24 vs 23" in rep["checks"]["calibration"]["reason"]
+    for k in ("L1", "L2"):
+        assert rep["checks"][k]["status"] == "NOT RUN", k
+        assert rep["checks"][k]["status"] != "PASS"
+    # 接入文件本身仍然落盘了 —— "初始化成功"与"完整软件验证成功"是两件事
+    assert (proj / "tools" / "build.py").is_file()
+
+
+def test_l0_failure_stops_before_calibration(tmp_path, monkeypatch):
+    calls = stub_layers(monkeypatch, [], l0=1)
+    proj = make_cube(tmp_path / "proj", name="proj")
+    assert run_checks_init(proj, ["--run-checks"],
+                           expect_exit=S.EXIT_CHECKS_FAILED) == 4
+    assert calls == ["L0"], calls
+    rep = report_of(proj)
+    assert rep["checks"]["L0"]["status"] == "FAIL"
+    for k in ("calibration", "L1", "L2"):
+        assert rep["checks"][k]["status"] == "NOT RUN", k
+
+
+def test_build_failure_gives_exit_4_and_l2_still_runs(tmp_path, monkeypatch):
+    calls = stub_layers(monkeypatch, [], l1=2)
+    proj = make_cube(tmp_path / "proj", name="proj")
+    assert run_checks_init(proj, ["--run-checks"],
+                           expect_exit=S.EXIT_CHECKS_FAILED) == 4
+    assert calls == ["L0", "calibrate", "L1", "L2"], calls
+    rep = report_of(proj)
+    assert rep["checks"]["L1"]["status"] == "FAIL"
+    assert rep["checks"]["L2"]["status"] == "PASS"      # L1 失败也照样留 L2 证据
+
+
+def test_l2_failure_gives_exit_4_and_no_faked_build_log(tmp_path, monkeypatch):
+    calls = stub_layers(monkeypatch, [], l2=1)
+    proj = make_cube(tmp_path / "proj", name="proj")
+    assert run_checks_init(proj, ["--run-checks"],
+                           expect_exit=S.EXIT_CHECKS_FAILED) == 4
+    assert calls == ["L0", "calibrate", "L1", "L2"]
+    rep = report_of(proj)
+    assert rep["checks"]["L2"]["status"] == "FAIL"
+    # 初始化器绝不替用户伪造构建日志
+    assert not list((proj / "tools").glob("build_logs/*.log"))
+
+
+def test_existing_threshold_is_not_recalibrated(tmp_path, monkeypatch):
+    """已经标定过的工程：`--run-checks` 直接跑 L1/L2，不重复烧两次构建。"""
+    calls = stub_layers(monkeypatch, [], threshold_present=True)
+    proj = make_cube(tmp_path / "proj", name="proj")
+    assert run_checks_init(proj, ["--run-checks"]) == 0
+    assert calls == ["L0", "L1", "L2"], calls
+    rep = report_of(proj)
+    assert rep["checks"]["calibration"]["status"] == "SKIPPED"
+    assert "无需重新标定" in rep["checks"]["calibration"]["reason"]
+
+
+def test_skip_build_skips_l1_and_calibration_but_keeps_l0_and_l2(tmp_path, monkeypatch):
+    calls = stub_layers(monkeypatch, [])
+    proj = make_cube(tmp_path / "proj", name="proj")
+    assert run_checks_init(proj, ["--run-checks", "--skip-build"]) == 0
+    assert calls == ["L0", "L2"], calls
+    rep = report_of(proj)
+    assert rep["checks"]["L0"]["status"] == "PASS"
+    assert rep["checks"]["calibration"]["status"] == "NOT RUN"
+    assert rep["checks"]["L1"]["status"] == "NOT RUN"
+    assert rep["checks"]["L2"]["status"] == "PASS"
+    assert "--skip-build" in rep["checks"]["L1"]["reason"]
+    # 没跑过构建 -> 阈值当然没被写进去
+    assert live_threshold(proj) is None
+
+
+def test_skip_build_reports_l2_failure_honestly_when_build_evidence_is_missing(
+        tmp_path, monkeypatch):
+    """--skip-build 时 L2 若因缺构建证据而失败，**如实**报 4 —— 不补构建日志。"""
+    calls = stub_layers(monkeypatch, [], l2=1)
+    proj = make_cube(tmp_path / "proj", name="proj")
+    assert run_checks_init(proj, ["--run-checks", "--skip-build"],
+                           expect_exit=S.EXIT_CHECKS_FAILED) == 4
+    assert calls == ["L0", "L2"], calls
+    assert report_of(proj)["checks"]["L2"]["status"] == "FAIL"
+    assert not list((proj / "tools").glob("build_logs/*.log"))
+
+
+def test_no_run_checks_marks_everything_not_run(tmp_path, monkeypatch):
+    def forbidden(*a, **k):
+        raise AssertionError("--no-run-checks 时不该调用任何检查步骤")
+    calls = stub_layers(monkeypatch, [])
+    monkeypatch.setattr(S, "calibrate_threshold", forbidden)
+    monkeypatch.setattr(S, "run_build_l1", forbidden)
+    monkeypatch.setattr(S, "run_pytest_l2", forbidden)
+    proj = make_cube(tmp_path / "proj", name="proj")
+    assert run_init(proj, ["--project-name", "proj"]) == 0   # 自带 --no-run-checks
+    assert calls == [], calls
+    rep = report_of(proj)
+    for k in ("L0", "calibration", "L1", "L2", "L3"):
+        assert rep["checks"][k]["status"] == "NOT RUN", k
+        assert rep["checks"][k]["status"] != "PASS"
+
+
+def test_default_init_does_not_build_or_calibrate(tmp_path, monkeypatch):
+    """默认（既没 --run-checks 也没 --no-run-checks）= 接入 + L0，绝不构建。"""
+    calls = stub_layers(monkeypatch, [])
+    proj = make_cube(tmp_path / "proj", name="proj")
+    assert run_checks_init(proj) == 0
+    assert calls == ["L0"], calls
+    rep = report_of(proj)
+    assert rep["checks"]["L0"]["status"] == "PASS"
+    for k in ("calibration", "L1", "L2"):
+        assert rep["checks"][k]["status"] == "NOT RUN", k
+
+
+@pytest.mark.parametrize("extra", [
+    ["--run-checks", "--no-run-checks"],
+    ["--skip-build"],
+    ["--skip-build", "--no-run-checks"],
+])
+def test_bad_flag_combinations_return_2_and_touch_nothing(tmp_path, extra):
+    proj = make_cube(tmp_path / "proj", name="proj")
+    before = snapshot(proj)
+    code = autolab.main(["init", "--family", FAMILY, "--target", str(proj),
+                         "--platform", str(PLAT["dir"]), "--project-name", "proj"]
+                        + extra)
+    assert code == S.EXIT_INPUT
+    assert snapshot(proj) == before, "参数组合不对时目标目录必须零变化"
+
+
+def test_run_checks_report_lists_the_measured_evidence(tmp_path, monkeypatch):
+    stub_layers(monkeypatch, [], measure=(24, 24))
+    proj = make_cube(tmp_path / "proj", name="proj")
+    assert run_checks_init(proj, ["--run-checks"]) == 0
+    md = (proj / "docs" / "AUTOLAB_INIT.md").read_text(encoding="utf-8")
+    assert "构建阈值标定" in md
+    assert "两次动作数一致：`24` = `24`" in md
+    assert "floor(2/3 × 24) = **16**" in md
+    assert "只改阈值标记块" in md
+    assert "不代表" in md and "增量" in md          # 不声称增量已验证
+    assert "NOT RUN" in md and "PASS" in md
+
+
+def test_calibrate_subcommand_is_wired_and_unknown_ones_are_refused(capsys):
+    """`calibrate` 已接上；`gen-ioc` 仍是明确的"未实现"，不建空壳。"""
+    assert autolab.main([]) == S.EXIT_INPUT
+    out = capsys.readouterr().out
+    assert "gen-ioc" in out and "未实现" in out.lower() or "刻" in out
+    with pytest.raises(SystemExit) as ei:      # argparse 拒绝未知子命令 = 退出码 2
+        autolab.main(["gen-ioc"])
+    assert ei.value.code == 2

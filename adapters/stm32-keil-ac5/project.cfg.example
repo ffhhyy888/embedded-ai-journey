@@ -10,7 +10,8 @@
 # 复制到新工程时，下列各项【必须重新校准】，不要照抄：
 #   1. [project] name               —— 工程名（= Keil 工程名 = 产物目录名）
 #   2. [build]   uvprojx / axf      —— 新工程的工程文件与产物路径
-#   3. [build]   min_compile_lines  —— 必须按新工程【实测】的全量编译动作数重定
+#   3. [build]   min_compile_lines  —— 必须按新工程【实测】重定（用 autolab calibrate）；
+#                                      本例的 20 是参考工程的取值，**不是**新工程的实测值
 #   4. [serial]  port / baud        —— 换板子或换 USB 口后端口号会变
 #   5. [serial]  boot_marker        —— 新工程的启动契约多半与 SDIO_test 不同
 #   6. [image]   flash_size / ram_size / required_symbols —— 按新芯片与新工程填
@@ -51,10 +52,17 @@ axf = MDK-ARM/SDIO_test/SDIO_test.axf
 
 # 四判据之三的阈值：构建日志里 compiling/assembling/linking 的行数下界。
 # 作用：防"增量构建什么都没编却返回 0"这种假 0。
-# ⚠️ 必须按新工程【实测】标定：跑一次全量构建，数一下实际条数，
-#    取一个"真构建必然超过、空转必然达不到"的安全下界。
+# ⚠️ 必须按新工程【实测】标定，**不要照抄本文件的 20** —— 那是 SDIO_test 的值，
+#    不是你的工程的实测值。抄错的后果是判据 3 形同虚设（永远绿）。
+#
+# 标定方式（自动跑两次真实全量软件构建；不烧录、不接调试器、不开串口）：
+#   python tools/autolab.py calibrate --target <工程根>
+#   或在 `autolab init --run-checks` 里自动完成。
+# 规则：两次动作数一致且为正、且其余判据全过时，取 floor(2/3 × 动作数)。
+# ⚠️ 由 `autolab init` 生成的工程里，这一行**先是注释**（<待标定>），
+#    标定成功后由工具改写进标记块；本参考文件里的 20 只是历史取值，供对照。
 # 本例出处：SDIO_test 全量构建实测 56 条（见 tools/build_logs/ 的 PASS 日志），
-#          取约 1/3 作为下界 20。
+#          当时取约 1/3 作为下界 20。
 min_compile_lines = 20
 
 

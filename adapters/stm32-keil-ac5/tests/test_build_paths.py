@@ -26,8 +26,11 @@ name = {name}
 [build]
 uvprojx = MDK-ARM/{name}.uvprojx
 axf = MDK-ARM/{name}/{name}.axf
-min_compile_lines = {min_lines}
-"""
+{min_lines_block}"""
+
+# min_lines=None -> **整行省略**（模拟"新工程阈值尚未标定"的真实状态：
+#   生成出来的 tools/project.cfg 里这一行就是被注释掉的，即字段根本不存在）。
+CFG_NO_THRESHOLD = "# min_compile_lines = <待标定>\n"
 
 
 def make_tree(tmp_path, name, min_lines=20):
@@ -38,8 +41,12 @@ def make_tree(tmp_path, name, min_lines=20):
     (root / "MDK-ARM" / f"{name}.uvprojx").write_text("<Project/>", encoding="utf-8")
     axf = root / "MDK-ARM" / name / f"{name}.axf"
     axf.write_bytes(b"fake-axf")
+    if min_lines is None:
+        block = CFG_NO_THRESHOLD
+    else:
+        block = "min_compile_lines = %s\n" % (min_lines,)
     (root / "tools" / "project.cfg").write_text(
-        CFG_TMPL.format(name=name, min_lines=min_lines), encoding="utf-8")
+        CFG_TMPL.format(name=name, min_lines_block=block), encoding="utf-8")
     return root, axf
 
 
@@ -167,3 +174,122 @@ def test_threshold_comes_from_cfg_not_code(tmp_path):
 
     assert checks_lo[2][1] is True      # 30 >= 20
     assert checks_hi[2][1] is False     # 30 < 56
+
+
+# ------------------------------------------------------------ 测量模式（--measure）
+# 用途：新工程的 min_compile_lines 还没标定时，也要能跑**一次真实全量构建**把动作数
+#      测出来 —— 否则永远标不出来。
+# ⚠️ 这些用例专门盯住"测量模式**只**绕过阈值"这条边界：任何"顺手把整个判据放宽"的
+#    改法都会让下面几条红（这就是它们的反向标定价值）。
+
+def test_threshold_missing_is_a_hard_error_on_the_normal_path(tmp_path):
+    """没有阈值时普通路径必须报配置错 —— 不许静默兜底、不许当成"没检查"。"""
+    root, _ = make_tree(tmp_path, "Uncal", min_lines=None)
+    with pytest.raises(project_config.ConfigKeyMissing):
+        build.resolve_paths(project_config.load(root / "tools"))
+
+
+def test_measure_mode_resolves_paths_without_a_threshold(tmp_path):
+    root, axf = make_tree(tmp_path, "Uncal2", min_lines=None)
+    p = build.resolve_paths(project_config.load(root / "tools"),
+                            require_threshold=False)
+    assert p.min_compile_lines is None
+    # 只有阈值被放宽；路径项一个都不许放宽
+    assert p.axf == axf.resolve()
+    assert p.uvprojx_name == "Uncal2.uvprojx"
+
+
+def test_measure_mode_does_not_judge_the_threshold(tmp_path):
+    root, axf = make_tree(tmp_path, "Meas", min_lines=None)
+    p = build.resolve_paths(project_config.load(root / "tools"),
+                            require_threshold=False)
+    passed, checks = build.evaluate(0, make_log(n_actions=3),
+                                    axf.stat().st_mtime - 1, p, measure=True)
+
+    assert passed is True, "阈值不判，但其余三条都过 -> 测量成功"
+    assert len(checks) == 4
+    name, ok, detail = checks[2]
+    assert name == build.MEASURE_CHECK_NAME
+    assert "实际 3 条" in detail, "测量模式必须**报出**实际条数，不能什么都不说"
+    assert ok is True
+
+
+def test_measure_row_is_not_named_like_a_threshold_pass(tmp_path):
+    """测量模式那一行必须一眼可辨 —— 免得被当成"判据 3 通过了"。"""
+    root, axf = make_tree(tmp_path, "Named", min_lines=None)
+    p = build.resolve_paths(project_config.load(root / "tools"),
+                            require_threshold=False)
+    _, checks = build.evaluate(0, make_log(), axf.stat().st_mtime - 1, p, measure=True)
+    assert ">=" not in checks[2][0], checks[2][0]
+    assert "测量" in checks[2][0], checks[2][0]
+
+
+def test_missing_threshold_on_a_non_measure_call_is_a_failure_not_a_pass(tmp_path):
+    """测量模式是**显式**的。没给 measure=True 却拿着 None 阈值 -> 必须判 FAIL。"""
+    root, axf = make_tree(tmp_path, "Sneaky", min_lines=None)
+    p = build.resolve_paths(project_config.load(root / "tools"),
+                            require_threshold=False)
+    passed, checks = build.evaluate(0, make_log(), axf.stat().st_mtime - 1, p)
+
+    assert passed is False
+    assert checks[2][1] is False
+
+
+@pytest.mark.parametrize("exit_code, errors, warnings, n_actions, stats", [
+    (2, 1, 0, 30, True),      # 编译错误
+    (1, 0, 3, 30, True),      # 有警告也算不通过
+    (0, 0, 0, 30, False),     # 日志里没有统计行 -> 日志无效
+])
+def test_measure_mode_still_fails_on_bad_builds(tmp_path, exit_code, errors,
+                                                warnings, n_actions, stats):
+    """⚠️ 核心边界：测量模式**不得**把坏构建判成成功。"""
+    root, axf = make_tree(tmp_path, "Bad%d" % exit_code, min_lines=None)
+    p = build.resolve_paths(project_config.load(root / "tools"),
+                            require_threshold=False)
+    log = make_log(n_actions=n_actions, errors=errors, warnings=warnings, stats=stats)
+    passed, _ = build.evaluate(exit_code, log, axf.stat().st_mtime - 1, p, measure=True)
+    assert passed is False
+
+
+@pytest.mark.parametrize("t0_delta, axf_gone", [
+    (+100, False),            # 产物没更新
+    (0, True),                # 产物根本不存在
+])
+def test_measure_mode_still_fails_on_unupdated_artifact(tmp_path, t0_delta, axf_gone):
+    root, axf = make_tree(tmp_path, "Axf", min_lines=None)
+    p = build.resolve_paths(project_config.load(root / "tools"),
+                            require_threshold=False)
+    if axf_gone:
+        axf.unlink()
+        t0 = 0.0
+    else:
+        t0 = axf.stat().st_mtime + t0_delta
+    passed, _ = build.evaluate(0, make_log(), t0, p, measure=True)
+    assert passed is False
+
+
+def test_measure_payload_carries_only_measured_facts(tmp_path):
+    """结果行是给 `autolab calibrate` 读的 —— 里面不许有推断值。"""
+    root, axf = make_tree(tmp_path, "Payload", min_lines=None)
+    p = build.resolve_paths(project_config.load(root / "tools"),
+                            require_threshold=False)
+    log = make_log(n_actions=24)
+    t0 = axf.stat().st_mtime - 1
+    payload = build.measure_payload(0, log, t0, p, True, Path("tools/build_logs/x.log"))
+
+    assert payload["actions"] == 24
+    assert payload["threshold_judged"] is False
+    assert payload["errors"] == 0 and payload["warnings"] == 0
+    assert payload["uvision_exit_code"] == 0
+    assert payload["axf_updated"] is True
+    assert payload["passed"] is True
+
+    # 构建失败时 passed 必须是 False —— calibrate 只认这一个字段
+    bad = build.measure_payload(2, make_log(errors=1), t0, p, False, Path("x.log"))
+    assert bad["passed"] is False
+
+
+def test_measure_prefix_is_ascii_and_unambiguous():
+    """结果行前缀走的是 stdout，Windows 重定向到管道时是 GBK —— 必须纯 ASCII。"""
+    assert build.MEASURE_PREFIX.isascii()
+    assert build.MEASURE_PREFIX.endswith("=")

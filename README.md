@@ -141,28 +141,74 @@ python tools/autolab.py init \
 4. 跑一次 **L0 自检**，把来源 SHA-256、L0 原始输出与全部 WARN 写进
    `docs/AUTOLAB_INIT.md` 与 `tools/autolab_init.json`
 
-**它不会做的事**：不烧录、不构建、不跑 L2、不执行 HIL；
-不碰 Git（不建仓、不 `add`、不提交、不改 `.git/config`）；
-不修改平台仓库本身。L1/L2 在报告里明确记为 `NOT RUN`。
+**默认只做「接入 + L0」**。要一次把软件验证闭环跑完，加 `--run-checks`：
+
+```bash
+python tools/autolab.py init --family stm32-keil-ac5 --target <目录> --run-checks
+```
+
+`--run-checks` 按**固定顺序**追加三步，任何一步失败就**立刻停止后面的**并把它们如实记成
+`NOT RUN`（不跳过、不假装跑过、**不伪造构建日志**）：
+
+| 顺序 | 步骤 | 工具 | 说明 |
+|---|---|---|---|
+| 1 | L0 环境自检 | `tools/preflight.py` | 默认路径也跑这一步 |
+| 2 | 构建阈值标定 | `autolab calibrate` | **仅当** `tools/project.cfg` 里还没有生效阈值；跑两次真实全量构建 |
+| 3 | L1 正式构建 | `tools/build.py` | 四判据全判 |
+| 4 | L2 无板测试 | `pytest -m "not hardware"` | deselect 掉那条会重复构建的用例（L1 已经构建过） |
+
+- `--skip-build`：配合 `--run-checks`，跳过 L1 **与**阈值标定（标定要跑两次构建），保留 L0 与 L2。
+  L2 若因缺少构建证据而失败，**如实报失败**，不补日志。
+- `--no-run-checks`：全部跳过，报告里记 `NOT RUN`（**不是** `PASS`）。
+
+**它不会做的事**：不烧录、不连接调试器、不开串口、不执行 HIL、不做 Option Bytes；
+不碰 Git（不建仓、不 `add`、不提交、不改 `.git/config`）；不修改平台仓库本身。
+L3（真机 HIL）在报告里**永远**是 `NOT RUN`。
+
+⚠️ **「初始化成功」≠「完整软件验证成功」**：前者是「36 个文件都写对了」，后者是
+「L0–L2 全绿」。前者**不等于**后者，报告里分列，不合并表述。`NOT RUN`（没跑）与
+`SKIPPED`（本轮不需要跑）**都不是** `PASS`。
 
 退出码：
 
 | 码 | 含义 | 目标目录 |
 |---|---|---|
-| `0` | 成功，且 L0 通过 | 已写入 |
+| `0` | 成功，且**本次请求的**检查全部通过 | 已写入 |
 | `2` | 参数 / 平台源 / 模板 / 工程结构有问题 | **零变化** |
 | `3` | 已有同名且内容不同的文件，未加 `--force` | **零变化** |
-| `4` | 文件已写入，但 L0 自检未通过 | 已写入（保留，便于排查） |
+| `4` | 文件已写入，但 L0 / L1 / L2 有未通过的 | 已写入（保留，便于排查） |
+| `5` | 阈值标定无法完成（计数不一致 / 构建失败 / 日志无效 / 产物未更新） | 已写入，但 `tools/project.cfg` **逐字节不变**；L1/L2 记 `NOT RUN` |
+
+### 构建阈值标定（`autolab calibrate`）
+
+`build.py` 的判据 3（编译动作条数 ≥ `min_compile_lines`）防的是「增量空转返回 0」的假 0。
+这个阈值**只能实测**，不能抄参考工程的数：
+
+```bash
+python tools/autolab.py calibrate --target <工程根>
+```
+
+它跑**两次真实全量软件构建**（不烧录、不接调试器、不开串口），两次动作数一致且为正、
+且退出码 / `0 Error 0 Warning` / 产物时间戳三条判据全过时，取 **`floor(2/3 × 动作数)`**
+写入 `tools/project.cfg` 的阈值标记块（例如两次均 24 条 → 16）。只改这一块，其余逐字节不变。
+
+标不出来（两次计数不同 / 任一构建失败 / 日志无效 / 产物未更新）就返回 **5**，
+且 `tools/project.cfg` **逐字节不变** —— 不做"猜一个数"式兜底。
+
+⚠️ 阈值只防「空转假 0」，**不代表**「真实增量构建已验证」：某些命令行构建工具每次都全量重编，
+"空转"根本没被构造出来过。这种情况只能声明**判定逻辑**已双向标定。
 
 加 `--force` 覆盖前，原件先备份到 `.autolab-init/backup-<时间戳>/` 并**逐字节校验**；
 校验不过就整轮失败，绝不覆盖。
 
 **不确定的东西不会被编造**：`--board` 没给就写「未配置」并进 WARN 列表；
-`min_compile_lines` 和串口的 `port` / `boot_marker` / `reset_cmd_hex` **有意留空**
-（理由写在生成的 `tools/project.cfg` 里）—— 猜一个值比留空更危险，
-因为猜错会让判据变成"永远绿"。生成的 `CLAUDE.md` 第三节「本工程的坑」**必须人工填**。
+`min_compile_lines` 生成时**仍是注释**（`# min_compile_lines = <待标定>`），
+理由与标定命令写在生成文件的标记块里；串口的 `port` / `boot_marker` / `reset_cmd_hex`
+同样留空 —— 猜一个值比留空更危险，因为猜错会让判据变成"永远绿"。
+生成的 `CLAUDE.md` 第三节「本工程的坑」**必须人工填**。
 
-`--no-run-checks` 可跳过 L0（报告里记为 `SKIPPED`，不是 `PASS`）。
+未标定的工程直接跑 `python tools/build.py` 会**报配置错误并退出 1** ——
+这是**有意的可见失败**，不是漏配。
 
 <details>
 <summary><b>手工接入（应急 / 非 CubeMX 工程）</b></summary>
@@ -227,8 +273,9 @@ cp skeleton/gitignore.template                  <新工程>/.gitignore
 
 - `project.cfg` 里照抄参考值（工程名 / 编译动作阈值 / 内存预算 / 必需符号 / 串口）
   会**直接判错** —— 那是 SDIO_test 的值，不是你的。
-  `autolab init` 会把能实测的项（工程名 / 输出路径 / 内存预算 / 波特率）按本工程填好，
-  实测不出的项（`min_compile_lines`、串口 `port` 等）**留空并进 WARN 列表**，不猜
+  `autolab init` 会把能实测的项（工程名 / 输出路径 / 内存预算 / 波特率）按本工程填好；
+  **实测不出的项不猜**：`min_compile_lines` 写成注释并附标定命令
+  （`autolab calibrate`），串口 `port` 等同样留空并进 WARN 列表
 - `.gitignore` 里忘了替换 `<PROJECT_NAME>`，规则就匹配不到任何东西，
   **Keil 的输出目录会进版本库**
 
