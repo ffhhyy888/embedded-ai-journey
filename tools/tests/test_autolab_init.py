@@ -1503,3 +1503,44 @@ def test_calibrate_subcommand_is_wired_and_unknown_ones_are_refused(capsys):
     with pytest.raises(SystemExit) as ei:      # argparse 拒绝未知子命令 = 退出码 2
         autolab.main(["gen-ioc"])
     assert ei.value.code == 2
+
+
+# ============================================================================
+# 17. 标定不得在标记块**之外**留下自相矛盾的状态断言
+#
+# 由来（真实端到端跑出来的）：`calibrate` 只改标记块，而 `init` 生成的
+# project.cfg **文件头**里写着 "min_compile_lines <- 【尚未标定】有意省略"。
+# 标定成功后，文件里就同时存在"已写入 16"和"尚未标定"两种说法 ——
+# 谁来读都会以为有一个是错的。修法是把文件头改成**状态中立**、指向标记块，
+# 而不是让 calibrate 去改块外的内容（那会破坏"只改一块"这条安全不变量）。
+# ============================================================================
+def test_no_calibration_status_is_asserted_outside_the_marker_block(tmp_path,
+                                                                    monkeypatch):
+    """标定状态**只能**由标记块声明。
+
+    块外的文字（文件头）如果也写死"尚未标定"，标定成功后文件里就会同时存在
+    "已写入 16"与"尚未标定"两种说法 —— 读的人必然以为有一个是错的。
+    修法是让块外保持**状态中立**，而不是让 calibrate 去改块外的内容
+    （那会破坏"只改一块"这条安全不变量）。
+    """
+    monkeypatch.setattr(S, "run_build_measure", fake_measure([24, 24]))
+    proj = a_project(tmp_path)
+
+    def split_now():
+        text = (proj / "tools" / "project.cfg").read_text(encoding="utf-8")
+        pre, blk, suf = S.split_threshold_block(text)
+        return pre + suf, blk
+
+    before, blk0 = split_now()
+    assert "尚未标定" not in before, "文件头把标定状态写死到了标记块外"
+    assert "尚未标定" in blk0, "状态本该由标记块声明（否则这个用例是空的）"
+
+    assert run_calibrate(proj) == 0
+
+    after, blk1 = split_now()
+    assert "尚未标定" not in after, "标定后块外仍写着「尚未标定」，与已写入的阈值矛盾"
+    assert "尚未标定" not in blk1, "标定后标记块里还留着「尚未标定」"
+    assert "min_compile_lines = 16" in blk1
+    # 而**确实**尚未确定的东西不许被顺手改掉（串口三项仍是省略状态）
+    assert "【尚未确定】" in after
+    assert not re.search(r"(?m)^\s*(port|boot_marker|reset_cmd_hex)\s*=", after)
