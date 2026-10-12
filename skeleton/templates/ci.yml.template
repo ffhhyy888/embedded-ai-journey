@@ -1,0 +1,263 @@
+# ============================================================================
+# 流水线定义 —— 两层，刻意分开
+# ============================================================================
+# 来源说明
+#   本文件是【平台模板】，不是任何工程的运行中工作流。脱胎于 Autolab 平台上第一个
+#   跑通完整闭环的真实工程（STM32 + Keil MDK/ARMCC AC5，2026-10 验收），
+#   已剥离该工程的全部项目特定数据：串口端口 / 固件启动标记 / 复位命令的**具体取值**、
+#   板子专用的 runner 标签、项目专属提交记录与叙述。
+#
+# ⚠️⚠️ 实例化之前，本文件【不能运行】。它不是"配好了只差推送"的状态。
+#      必须先把下面两个变量换成真实值，并先配置好 self-hosted runner。
+# ============================================================================
+#
+# 变量写法：美元符号紧跟花括号，里面是大写字母 / 数字 / 下划线组成的变量名。
+#   实例化工具**只**替换这种形式；其余文字一律原样保留。
+#   ⚠️ GitHub Actions 自己的表达式是把变量包在**双层**花括号里（美元符号 + 双花括号），
+#      与本模板的**单层**写法不同，**不会被替换规则匹配**，原样保留。
+#
+# 本文件只有两个变量，都必须替换：
+#
+#   ${RUNNER_LABELS_SOFTWARE}  层1 用的 runner 标签，含方括号、逗号分隔。
+#                              必须替换成【带方括号的 YAML 流式序列】，
+#                              例如：  [self-hosted, windows, 你的工具链标签]
+#                              这是**软件** runner：只需要工具链，不需要板子。
+#
+#   ${RUNNER_LABELS_HARDWARE}  层2 用的 runner 标签，格式同上，在其基础上**再加一个
+#                              用来标识"这台机器挂着开发板"的标签**，
+#                              例如：  [self-hosted, windows, 你的工具链标签, 你的板子标签]
+#                              ⚠️ 标签名由你自己起，不要照抄任何参考工程。
+#
+# ⚠️ 另外：下面步骤里引用的 `tools/build.py`、`tests/test_build.py::test_build_passes`、
+#    `tools/build_logs/`、`runs/**/evidence/` 都是**平台参考实现**里的文件名。
+#    本工程若不同，按实际情况改 —— 不要改命令的**语义**（去重 ≠ 跳过构建）。
+#
+# 替换后，本文件的 YAML 语法必须仍然有效（`runs-on:` 的值是一个序列）。
+#
+# 使用前必须完成的准备（本工作流不会替你装任何东西）：
+#   · 至少一台 self-hosted runner，且已注册上面用到的全部标签
+#   · runner 上装好：Python 3.10+ / 系统级工具链（编译器 + 符号表工具）/ git / bash
+#   · 工具链装在非默认位置时，在 runner 上设好 AUTOLAB_* 环境变量
+#   · ⚠️ 层2 的 runner 还要**真的插着开发板 + 串口 + 调试器**
+#
+# ⚠️ 层2 只能手动触发。若硬件 runner 尚未配置好，触发了也只会一直排队 ——
+#    **不要在 runner 就绪之前触发层2**。层2 会**真的烧录**开发板。
+# ============================================================================
+#
+# 为什么必须用 self-hosted：
+#   · 构建依赖 Windows 独占 + 需要授权的商业工具链，托管 runner 装不了
+#   · 层2 还要插着真实开发板、串口和调试器
+#   这正是官方推荐 self-hosted runner 的典型场景。
+#
+# 分层理由（与平台一致）：
+#   真机用例依赖"板子插着、串口连好、调试器可用"。硬件一旦掉线，CI 就变成
+#   **随机红灯**；红灯一多，大家就不再相信红灯了。所以真机层单独隔离、手动触发。
+# ============================================================================
+
+name: CI
+
+on:
+  push:                     # 层1 每次提交都跑
+  pull_request:             # 层1 每个 PR 都跑
+  workflow_dispatch:        # 层2 只能这样显式触发
+
+jobs:
+
+  # ==========================================================
+  # 层1：自动软件验证 —— 不依赖任何硬件
+  # ==========================================================
+  # 覆盖：L0 环境预检 + L1 构建 + L2 镜像/静态/宿主机测试
+  #
+  # ✅ 本层【不需要】开发板、串口或调试器。
+  # ==========================================================
+  no-hardware:
+    name: 层1 构建 + 无板测试
+    runs-on: ${RUNNER_LABELS_SOFTWARE}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 依赖版本锁定在 requirements.txt（本机实测通过的版本）。
+      # 不要在这里另外指定版本 —— 那会造出第二份真相。
+      - name: 安装 Python 依赖
+        run: python -m pip install -r requirements.txt
+
+      # L0：先确认环境齐了再谈别的。
+      # 这一步失败 = 工具链/依赖有问题，不是固件问题 —— 放在最前面是为了让
+      # "环境没配好"和"代码坏了"在日志里一眼可分。
+      - name: L0 环境预检
+        run: python tools/preflight.py
+
+      # L1：四判据构建（退出码 / 0 Error 0 Warning / 编译动作条数 / 产物时间戳）。
+      # 单独跑一次、单独命名，好处是构建日志在 CI 里是一个**独立可见**的步骤，
+      # 且失败时能直接对应到 build_logs/ 里的产物。
+      - name: L1 构建（四判据）
+        run: python tools/build.py
+
+      # L2：镜像契约 / 配置源一致性 / 静态检查 / 宿主机 C 单测。
+      #
+      # ⚠️ 这里必须 --deselect 掉 test_build_passes：
+      #    它内部会再调一次 tools/build.py（= 再全量构建一次）。
+      #    上面 L1 步骤刚构建过，不去重就会白编一遍。
+      #    这是**唯一的**重复来源，不要顺手把别的用例也 deselect 掉。
+      #    ⚠️ 这是"去重"，不是"跳过构建" —— 构建已由上面的步骤完成。
+      - name: L2 无板测试（镜像 / 配置一致性 / 静态 / 宿主机单测）
+        run: python -m pytest -m "not hardware" --deselect tests/test_build.py::test_build_passes -q
+
+      # 构建日志是排查"为什么红了"的第一手材料。
+      # if-no-files-found: ignore —— 若失败发生在构建之前（如依赖没装上），
+      # 这个目录本来就不存在，不该因此再报一个错。
+      - name: 失败时上传构建日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: tools/build_logs/
+          if-no-files-found: ignore
+
+
+  # ==========================================================
+  # 层2 前置条件检查 —— 决定 HIL 到底能不能跑
+  # ==========================================================
+  # ⚠️ 为什么需要这个 job（而不是让 hil.py 直接跑）：
+  #
+  #   hil.py **会真的烧录**，而它自身没有前置门禁。如果固件还没有实现
+  #   真机自动化所需的前提，直接跑它的后果是**拿参考工程的硬件契约去驱动本工程**：
+  #     · 去开一个不属于本工程的串口
+  #     · 等一个本工程固件永远不会发出的启动标记
+  #     · 发一个本工程固件不会响应的软复位命令
+  #
+  #   所以门禁放在 CI 这边：条件不满足就**明确跳过并说明原因**，绝不伪造 PASS。
+  #
+  #   本 job 检查的键名是**平台的配置契约**（见 tools/project.cfg 的 [serial] 一节），
+  #   对所有工程都一样，不是板级事实。
+  #
+  # ⚠️ 这个检查是**前置条件的代理**，不是固件能力的证明：
+  #    它只能证明"配置里声明了串口契约"，**不能**证明固件真的实现了协议。
+  #    而填写这些键的前提本来就是固件已经实现了它们 —— 所以这是一个自洽的约定，
+  #    但它仍然需要人来负责。
+  # ==========================================================
+  hil-preflight:
+    name: 层2 前置条件检查
+    runs-on: ${RUNNER_LABELS_SOFTWARE}
+    if: github.event_name == 'workflow_dispatch'
+    outputs:
+      ready: ${{ steps.contract.outputs.ready }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 复用工程自己的配置解析器（tools/project_config.py），
+      # **不**在这里另写一遍配置解析 —— 那样迟早会和工具的解析结果漂移。
+      - name: 检查 [serial] 契约是否已就绪
+        id: contract
+        shell: python
+        run: |
+          import os
+          import sys
+
+          # Windows runner 的 stdout 默认是 GBK，而下面的说明里有非 GBK 字符
+          # —— 不重设编码的话 print() 会抛 UnicodeEncodeError，
+          # 让这一步因为"打不出日志"而变红（与固件、与配置都无关）。
+          try:
+              sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+          except Exception:
+              pass
+
+          root = os.getcwd()
+          tools = os.path.join(root, "tools")
+          need = ("port", "boot_marker", "reset_cmd_hex")
+
+          missing = list(need)
+          problem = None
+          try:
+              sys.path.insert(0, tools)
+              import project_config
+              cfg = project_config.load(tools)
+              missing = [k for k in need if not cfg.has("serial", k)]
+          except Exception as e:
+              # 配置读不出来也算"没就绪"——但要把真实原因说出来，不要笼统报"没配好"
+              problem = "%s: %s" % (type(e).__name__, e)
+
+          ready = "true" if (not missing and problem is None) else "false"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write("ready=%s\n" % ready)
+
+          lines = ["## 层2（HIL）前置条件检查", ""]
+          if ready == "true":
+              lines += [":white_check_mark: **`[serial]` 契约已就绪** —— HIL 可以执行。", "",
+                        "⚠️ 注意：这只证明配置声明了契约，**不证明**固件真的实现了协议。"]
+          else:
+              lines += [
+                  ":no_entry: **前置条件未满足 —— HIL 已被阻止执行（不是跳过，不是 PASS）。**", "",
+                  "要跑 HIL，需要固件具备：**复位后输出启动标记**、**响应软复位命令**。",
+                  "这两条通常和业务逻辑一起实现 —— 在主循环还是空的时候，HIL 无从下手。", "",
+              ]
+              if problem:
+                  lines += ["读取 `tools/project.cfg` 失败（这本身就是问题）：", "",
+                            "```", problem, "```", ""]
+              if missing:
+                  lines += ["`tools/project.cfg` 的 `[serial]` 下缺少：`%s`" % "`、`".join(missing), "",
+                            "⚠️ 这些键**有意留空**是平台表达「尚未确定」的正规手段。"
+                            "空着时工具会退回**内置默认值** ——"
+                            "而那几个默认值属于**参考工程**，**不是本工程的硬件事实**。", ""]
+              lines += [
+                  "### 要解锁 HIL，需要先做到", "",
+                  "1. 固件实现启动标记与软复位协议。",
+                  "2. 确认串口硬件（USB-TTL 芯片型号与端口号）。",
+                  "3. 把 `port` / `boot_marker` / `reset_cmd_hex` 填进 `tools/project.cfg`。",
+                  "4. **并人工确认**固件确实实现了上述协议 —— 第 3 步只是配置，不是证据。", "",
+                  "详见 `docs/HARDENING.md` 的 L3 一节。",
+              ]
+
+          body = "\n".join(lines)
+          print(body)
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as f:
+                  f.write(body + "\n")
+
+      # 这一步**故意不失败**：条件不满足是"已知的、可预期的"状态，
+      # 不是本次提交引入的错误。让它红会把红灯变成噪音（"红灯一多就没人看了"）。
+      # 真正的阻断在下一个 job 的 if 条件上 —— 它会显示为 **skipped**，
+      # 而不是绿色的 PASS，也不会是误导性的红色 FAIL。
+      - name: 结论
+        run: echo "ready=${{ steps.contract.outputs.ready }}（false = 层2 将被跳过，原因见上一步）"
+
+
+  # ==========================================================
+  # 层2：手动 HIL 完整轮次 —— 需要真实硬件
+  # ==========================================================
+  # ⚠️ 触发条件叠了三层，缺一不可：
+  #     1. 只能手动触发（不能被 push/PR 意外触发）
+  #     2. 前置检查通过（ready == true）
+  #     3. 且必须挂在**带开发板**的 runner 上（${RUNNER_LABELS_HARDWARE}）
+  #
+  # ✅ 需要：开发板 + 串口 + 调试器
+  # ==========================================================
+  hardware:
+    name: 层2 HIL 完整轮次
+    needs: hil-preflight
+    if: needs.hil-preflight.outputs.ready == 'true'
+    runs-on: ${RUNNER_LABELS_HARDWARE}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 构建 -> 烧录 -> 真机判定 -> 失败自动取证 -> 出报告。
+      # ⚠️ 这一步会**真的烧录开发板**。
+      #    停止条件是写死在 hil.py 里的：默认只跑少量轮次、有硬上限，
+      #    任一轮 PASS 立即停止，且**绝不自动修改代码**。
+      - name: 构建 -> 烧录 -> 真机判定 -> 失败自动取证
+        run: python tools/hil.py
+
+      # 证据包：固件指纹 / 串口原始字节 / 运行态快照 / 故障现场 / 日志。
+      # 固件指纹里包含 git HEAD 与产物哈希 —— 用来回答"当时烧的是哪一版"。
+      - name: 失败时上传证据包
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hil-evidence
+          path: runs/**/evidence/
+          if-no-files-found: ignore

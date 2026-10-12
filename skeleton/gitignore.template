@@ -48,6 +48,9 @@ tests/artifacts/
 # build.py 归档的构建日志
 tools/build_logs/
 
+# autolab init 的暂存区与覆盖前备份（本机产物，不是工程内容）
+/.autolab-init/
+
 
 # ---- E. 工具链产物：STM32 + Keil MDK-ARM ----
 # ⚠️ 【换芯片家族 / 换 IDE 时，整节替换成你的工具链的规则】
