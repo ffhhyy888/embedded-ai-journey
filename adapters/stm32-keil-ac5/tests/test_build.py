@@ -13,7 +13,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def test_build_passes():
     """四判据必须全 PASS：
-    退出码 0 / 0 Error 0 Warning / >=20 条编译动作 / .axf 时间戳更新。
+    退出码 0 / 0 Error 0 Warning / 编译动作数 >= 项目配置的 min_compile_lines /
+    .axf 时间戳更新。
     """
     p = subprocess.run(
         [sys.executable, os.path.join(ROOT, "tools", "build.py")],

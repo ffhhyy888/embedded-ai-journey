@@ -11,7 +11,8 @@ PASS 判据（四条须同时满足，均为实测标定所得，见 ~/embedded-
     1. 退出码 == 0                          —— 0=成功 2=编译错误 15=工程不可读
     2. 日志匹配 "0 Error(s), 0 Warning(s)"
     3. 日志中 compiling/assembling/linking 行数 >= 阈值 —— 防止增量构建"假 0"
-       （阈值为 tools/project.cfg 的 min_compile_lines，换工程必须重新标定）
+       （阈值为 tools/project.cfg 的 min_compile_lines，换工程必须重新标定；
+        日志来源**只取一份**：uVision 的 stdout 与 -o 内容相同，相加会双重计数）
     4. 产物 .axf 时间戳晚于本次构建启动时刻              —— 防止"没产出新固件"
 
 退出码: PASS -> 0, FAIL -> 1   （可直接被 CI / Agent 调用）
@@ -73,10 +74,43 @@ def resolve_paths(cfg) -> Paths:
     )
 
 
+def pick_log_source(stdout_text: str, tmp_log: Path, t0: float) -> str:
+    """从 stdout 与 `-o` 日志里挑出**唯一**的权威日志来源。
+
+    ⚠️ 为什么必须只取一份（2026-10-12 缺陷修复）
+        uVision 把**同一份**构建日志**同时**写到 stdout 和 `-o` 文件。旧版
+        run_build() 把两者**相加**，于是每个编译动作被统计两次 —— 判据 3 拿到
+        2× 真实动作数（实测 48 = 24×2），阈值等于被绕过一半。
+        因此这里**绝不**把两份内容拼接。
+
+    选择规则
+        1. 优先本次构建的 `-o` 日志（它才带 `-o` 指定的完整内容）；
+        2. 仅当它 不存在 / 为空 / 时间戳早于 t0（是上一次构建的残留）时，
+           才回退到 stdout。回退是**降级**，但不静默 —— 打一条 [WARN] 说明原因。
+
+    安全性
+        回退只会换来源、不会相加，故任何一种情形下动作数都不会翻倍；
+        且实测 uVision 的 stdout 与 `-o` 内容一致，回退不影响判据结果。
+    """
+    if tmp_log.exists():
+        log_text = tmp_log.read_text(encoding="gbk", errors="replace")
+        if not log_text.strip():
+            reason = "uVision -o 日志为空"
+        elif tmp_log.stat().st_mtime < t0:
+            reason = "uVision -o 日志早于本次构建（疑似上一次的残留）"
+        else:
+            return log_text                     # 本次构建的权威日志
+    else:
+        reason = "uVision -o 日志不存在"
+
+    print(f"[WARN] 构建日志回退到 stdout：{reason}", file=sys.stderr)
+    return stdout_text
+
+
 def run_build(rebuild: bool, paths: Paths):
     """执行构建。返回 (退出码, 日志文本, 启动时刻)。"""
     flag = "-r" if rebuild else "-b"
-    tmp_log = paths.tmp_log                   # 兜底副本，被 .gitignore 忽略
+    tmp_log = paths.tmp_log                   # uVision -o 写入的本次构建日志
 
     t0 = time.time()                          # 判据 4 的时间基准，必须在构建前取
     proc = subprocess.run(
@@ -87,11 +121,9 @@ def run_build(rebuild: bool, paths: Paths):
     )
 
     # 工具链输出为 GBK；errors="replace" 保证绝不因编码崩掉
-    text = proc.stdout.decode("gbk", errors="replace")
-    if tmp_log.exists():
-        text += tmp_log.read_text(encoding="gbk", errors="replace")
-
-    return proc.returncode, text, t0
+    stdout_text = proc.stdout.decode("gbk", errors="replace")
+    # 日志来源**只取一份**（见 pick_log_source），绝不 stdout + 日志 相加
+    return proc.returncode, pick_log_source(stdout_text, tmp_log, t0), t0
 
 
 def evaluate(exit_code: int, text: str, t0: float, paths: Paths):
