@@ -5,7 +5,7 @@
 # 换电脑时：python -m pip install -r requirements.txt
 #
 # ⚠️ 注意这里**不包含** Keil MDK / ARMCC —— 那是系统级安装且需要授权，
-#    pip 装不了，必须单独装（见 CLAUDE.md 第八节）。
+#    pip 装不了，必须单独装（安装步骤见平台仓库 README.md「三种用法」）。
 #
 # 版本号都是"本机实测通过的版本"，不是随便写的 —— 换版本前请重跑
 # python -m pytest -m "not hardware" -q 确认。
