@@ -13,21 +13,49 @@
     · RCC.PLLM / PLLN / PLLQ      ↔ main.c 里 SystemClock_Config 的赋值
     · RCC.APB2CLKDivider          ↔ main.c 的 APB2CLKDivider
     · .ioc 自洽：由 HSE/PLLM*PLLN/PLLP 推出的 SYSCLK 应等于它自己记录的 SYSCLKFreq_VALUE
-退出码：0 = 一致；1 = 有漂移（列出具体项）
+
+被检查的 .ioc 从哪来
+    tools/project.cfg 的 [ioc] file —— 换工程不需要改本文件。
+    ⚠️ 这里以前写死 "SDIO_test.ioc"，后果不是"报个清楚的错"，而是**换工程后
+       本检查静默失效**：找不到 SDIO_test.ioc -> FileNotFoundError -> 退出码非 0
+       -> 被调用方当成"有漂移"。也就是说对除 SDIO_test 以外的任何工程，
+       这道防护只产生噪声、不产生保护。
+
+退出码：0 = 一致；1 = 有漂移（列出具体项）；2 = 配置/环境错误（无法确定 .ioc 路径）
 """
 import os
 import re
 import sys
 
+import project_config   # 与本文件同目录（拷进工程后同样在 tools/ 下）
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-IOC = os.path.join(ROOT, "SDIO_test.ioc")
+TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 HAL_CONF = os.path.join(ROOT, "Core", "Inc", "stm32f4xx_hal_conf.h")
 MAIN_C = os.path.join(ROOT, "Core", "Src", "main.c")
 
 
-def parse_ioc():
+def _cfg():
+    """加载工程配置。
+
+    ⚠️ 必须在**函数里**调用，不能在 import 期执行 —— 与 build.py 同一约定。
+    """
+    return project_config.load(TOOLS_DIR)
+
+
+def ioc_path():
+    """本工程 .ioc 的绝对路径 —— 来自 tools/project.cfg 的 [ioc] file。
+
+    只读配置，不在这里判断 [ioc] enabled：启用与否的判定在调用方
+    （tests/test_ioc.py）—— 那才是它既有语义所在，这里不重复也不改变它。
+    字段缺失（cfg 没有 [ioc] file）即报错，不静默兜底到任何固定文件名。
+    """
+    return str(_cfg().path("ioc", "file"))
+
+
+def parse_ioc(path):
     kv = {}
-    for line in open(IOC, encoding="utf-8", errors="replace"):
+    for line in open(path, encoding="utf-8", errors="replace"):
         line = line.strip()
         if "=" in line and not line.startswith("#"):
             k, v = line.split("=", 1)
@@ -52,9 +80,25 @@ def parse_code():
 
 
 def main():
-    ioc = parse_ioc()
+    try:
+        ioc_file = ioc_path()
+    except (project_config.ConfigError, OSError) as e:
+        # 配置读不到 = 工具自己坏了（退出码 2），**不是**"有漂移"（1）。
+        # 绝不静默通过：宁可报清楚，也不让这道防护悄悄消失。
+        print(f"[FAIL] 无法确定 .ioc 路径：{e}")
+        return 2
+
+    try:
+        ioc = parse_ioc(ioc_file)
+    except OSError as e:
+        print(f"[FAIL] 读不到 {ioc_file}：{e}")
+        return 2
+
     code = parse_code()
     bad = []
+
+    # 明示"检查的是哪一个 .ioc" —— 换工程后一眼能看出它读的是配置而不是固定文件名
+    print(f"  检查 .ioc = {ioc_file}")
 
     def cmp(name, a, b):
         if a != b:

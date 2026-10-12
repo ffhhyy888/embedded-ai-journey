@@ -28,10 +28,33 @@ import re
 import subprocess
 import sys
 
+import project_config   # 与本文件同目录（拷进工程后同样在 tools/ 下）
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-AXF = os.path.join(ROOT, "MDK-ARM", "SDIO_test", "SDIO_test.axf")
+TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 FROMELF = os.environ.get("AUTOLAB_FROMELF", r"F:\keil\ARM\ARMCC\bin\fromelf.exe")
 TARGET = "cortex_m"
+
+
+def _cfg():
+    """加载工程配置。
+
+    ⚠️ 必须在**函数里**调用，不能在 import 期执行 —— 与 build.py 同一约定
+    （hil.py 会以子进程方式调用本文件，import 期读配置会把失败点带偏）。
+    """
+    return project_config.load(TOOLS_DIR)
+
+
+def axf_path():
+    """本工程镜像的绝对路径 —— 来自 tools/project.cfg 的 [build] axf。
+
+    ⚠️ 这里以前写死 "MDK-ARM/SDIO_test/SDIO_test.axf"。换工程后探针会去读
+       **另一个工程**的镜像（或报一个与本工程无关的"文件不存在"），
+       而症状会表现为"符号表里查不到函数"，很难联想到是路径写死。
+    字段缺失即报错，不静默兜底到任何固定路径。
+    """
+    return str(_cfg().path("build", "axf"))
+
 
 # --------------------------------------------------------------- 故障诊断表
 # Cortex-M 内核故障状态寄存器（SCB）
@@ -57,9 +80,12 @@ IPSR_NAME = {0: "Thread(非异常)", 2: "NMI", 3: "HardFault",
 
 # --------------------------------------------------------------- 符号表
 
-def load_symtab(path=AXF):
-    """从 fromelf 的符号表里取 Code 段符号，用于「地址 -> 函数」。"""
-    out = subprocess.run([FROMELF, "--text", "-s", path],
+def load_symtab(path=None):
+    """从 fromelf 的符号表里取 Code 段符号，用于「地址 -> 函数」。
+
+    path 省略时取当前工程的 [build] axf（来自 tools/project.cfg）。
+    """
+    out = subprocess.run([FROMELF, "--text", "-s", path or axf_path()],
                          capture_output=True, timeout=60).stdout.decode("utf-8", "replace")
     pat = re.compile(r"^\s*\d+\s+(\S+)\s+0x([0-9a-fA-F]{8})\s+\S+\s+\d+\s+(\S+)\s+\S+\s*(0x[0-9a-fA-F]+)?\s*$")
     syms = []
@@ -85,7 +111,7 @@ def resolve(addr, syms):
 # --------------------------------------------------------------- 调试后端
 
 def pyocd(cmds, timeout=120):
-    argv = [sys.executable, "-m", "pyocd", "cmd", "-t", TARGET, "--elf", AXF]
+    argv = [sys.executable, "-m", "pyocd", "cmd", "-t", TARGET, "--elf", axf_path()]
     for c in cmds:
         argv += ["-c", c]
     p = subprocess.run(argv, capture_output=True, cwd=ROOT, timeout=timeout)
@@ -223,6 +249,15 @@ def main():
                     default=[], help="附带读一段内存，可多次给，如 --read 0x20000000 16")
     a = ap.parse_args()
     reads = [(int(x, 0), int(y, 0)) for x, y in a.read]
+
+    # ⚠️ 配置守卫必须在 try/finally **之前**：否则配置错误也会走到 finally 里的
+    #    ensure_running() —— 那会**真的去连一次调试探针**。配都没配好就不该碰硬件。
+    try:
+        axf_path()
+    except (project_config.ConfigError, OSError) as e:
+        emit("FAIL", note="config", error=f"无法确定镜像路径：{e}",
+             hint="检查 tools/project.cfg 的 [build] axf（换工程必须改这一项）")
+        return 2
 
     syms = load_symtab()
     try:
