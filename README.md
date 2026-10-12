@@ -27,12 +27,15 @@
 embedded-ai-journey/            ← 本仓库（平台）
 ├── README.md                   ← 你正在读
 ├── install.sh                  ← 新机器一键安装
+├── tools/                      ← 【平台工具】在本仓库里跑，不拷进工程
+│   └── autolab.py autolab_steps.py   ← autolab init（新工程接入）
 ├── skills/ai-embedded-autolab/ ← 【规则】skill 的受版本控制副本
 ├── skeleton/                   ← 【骨架】与芯片无关的通用件
 │   ├── tools/   serial_tool.py(串口激励观测) hil.py(编排/取证/报告) preflight.py(环境自检)
 │   ├── hooks/   pre-commit(提交前自动跑无板层)
 │   ├── tests/   test_host.py + host/(宿主机单元测试)
-│   └── pytest.ini  requirements.txt
+│   ├── templates/  README.md / HARDENING.md / ci.yml 的 .template（待实例化）
+│   └── pytest.ini  requirements.txt  CLAUDE.md.template  gitignore.template
 ├── adapters/                   ← 【适配器】按芯片家族
 │   └── stm32-keil-ac5/         ← 本仓库目前有的一套（含 PITFALLS.md）
 ├── CLAUDE.md                   ← 【入口】规则路由 + 硬约束速查（Claude Code 进来自动读）
@@ -111,13 +114,91 @@ cd ~/embedded-ai-journey && ./install.sh        # 装 skill + 检查环境
 
 ### B. 新起一个工程（同芯片家族）
 
+**推荐路径：`autolab init`。**
+
+> **前置条件**：目标目录里**已经有一个 CubeMX 生成好的工程** ——
+> 含 `.ioc`、`MDK-ARM/*.uvprojx`、`Core/`、`Drivers/`。
+> 本工具只做**平台接入**，不替你生成工程骨架；目录空着或结构不全，
+> 它会直接拒绝（退出码 2），而不是伪造一个看起来像样的工程。
+
 ```bash
-# 1) 拷骨架 + 对应家族的适配器进新工程
-cp -r ~/embedded-ai-journey/skeleton/*            <新工程>/
-cp -r ~/embedded-ai-journey/adapters/stm32-keil-ac5/* <新工程>/
-# 2) 写工程自己的 CLAUDE.md（坑要各工程自己填）
-# 3) ⚠️ 重新标定所有判据 —— 亲手制造一次失败，看它会不会红
+cd ~/embedded-ai-journey
+python tools/autolab.py init \
+  --family stm32-keil-ac5 \
+  --target <新工程的绝对路径> \
+  --project-name <工程名>          # 必须与 .ioc 的 ProjectManager.ProjectName 一致
 ```
+
+**先加 `--dry-run` 看清单再执行** —— `--dry-run` 不写任何文件，也不在目标目录建任何目录。
+
+它按固定顺序做四件事：
+
+1. **只读探测**目标工程：器件型号、Keil 输出目录/输出名、器件内存区间、串口波特率
+   全部**从工程里实测**，不照抄参考工程
+2. 校验平台源文件齐全、未被本地改动，且平台 HEAD 已包含最低修复版本（用 git 祖先关系判，不比日期）
+3. 逐字节复制骨架与家族适配器（**28** 个文件）+ 实例化 **6** 个模板，
+   合计写入 **34** 个文件；再加报告 **2** 份，一次成功初始化共产出 **36** 个文件
+4. 跑一次 **L0 自检**，把来源 SHA-256、L0 原始输出与全部 WARN 写进
+   `docs/AUTOLAB_INIT.md` 与 `tools/autolab_init.json`
+
+**它不会做的事**：不烧录、不构建、不跑 L2、不执行 HIL；
+不碰 Git（不建仓、不 `add`、不提交、不改 `.git/config`）；
+不修改平台仓库本身。L1/L2 在报告里明确记为 `NOT RUN`。
+
+退出码：
+
+| 码 | 含义 | 目标目录 |
+|---|---|---|
+| `0` | 成功，且 L0 通过 | 已写入 |
+| `2` | 参数 / 平台源 / 模板 / 工程结构有问题 | **零变化** |
+| `3` | 已有同名且内容不同的文件，未加 `--force` | **零变化** |
+| `4` | 文件已写入，但 L0 自检未通过 | 已写入（保留，便于排查） |
+
+加 `--force` 覆盖前，原件先备份到 `.autolab-init/backup-<时间戳>/` 并**逐字节校验**；
+校验不过就整轮失败，绝不覆盖。
+
+**不确定的东西不会被编造**：`--board` 没给就写「未配置」并进 WARN 列表；
+`min_compile_lines` 和串口的 `port` / `boot_marker` / `reset_cmd_hex` **有意留空**
+（理由写在生成的 `tools/project.cfg` 里）—— 猜一个值比留空更危险，
+因为猜错会让判据变成"永远绿"。生成的 `CLAUDE.md` 第三节「本工程的坑」**必须人工填**。
+
+`--no-run-checks` 可跳过 L0（报告里记为 `SKIPPED`，不是 `PASS`）。
+
+<details>
+<summary><b>手工接入（应急 / 非 CubeMX 工程）</b></summary>
+
+`autolab init` 是**清单的唯一真相来源** —— 只有它知道哪些文件该逐字节复制、
+哪些该实例化后改名。手工照抄这份清单，迟早漂移。
+
+真要走手工路，别凭记忆列文件，让工具把清单打出来：
+
+```bash
+python tools/autolab.py init --family stm32-keil-ac5 \
+       --target <新工程> --project-name <工程名> --dry-run
+```
+
+它会打印全部 **34** 个目标文件 = **28** 份直接拷贝 + **6** 份模板实例化。
+一次成功初始化共产出 **36** 个文件：另外 **2** 个是报告，即
+`docs/AUTOLAB_INIT.md` 与 `tools/autolab_init.json`（它们**总是**被覆盖，
+但覆盖前同样先备份）。其中 **6 个是模板，必须实例化后改名**，不能原样拷：
+
+| 平台模板 | 目标 | 处理 |
+|---|---|---|
+| `skeleton/CLAUDE.md.template` | `CLAUDE.md` | 替换 `<...>` 占位符 |
+| `skeleton/gitignore.template` | `.gitignore` | 替换占位符 |
+| `adapters/stm32-keil-ac5/project.cfg.example` | `tools/project.cfg` | **按本工程实测值重填** |
+| `skeleton/templates/README.md.template` | `README.md` | 替换 `${VAR}` |
+| `skeleton/templates/HARDENING.md.template` | `docs/HARDENING.md` | 替换 `${VAR}` |
+| `skeleton/templates/ci.yml.template` | `.github/workflows/ci.yml` | 替换 `${VAR}`，**保留 `${{ ... }}`** |
+
+> ⚠️ **不要 `cp -r skeleton/* <新工程>/`。** 那会把 `.template` 文件原样铺进去
+> （`CLAUDE.md.template`、`gitignore.template` 就成了没人认的怪文件），
+> 也会把平台自己的目录结构一并复制进工程。
+
+无论走哪条路，最后一步都一样：
+**⚠️ 重新标定所有判据 —— 亲手制造一次失败，看它会不会红**（见 `docs/engineering/TEST_AND_RELEASE_POLICY.md`）。
+
+</details>
 
 ### C. 换一个新芯片家族
 
@@ -131,17 +212,23 @@ cp -r ~/embedded-ai-journey/adapters/stm32-keil-ac5/* <新工程>/
 
 ## 迁移注意事项
 
-### 新工程：两份模板要各自实例化一次
+### 新工程：模板要各自实例化一次
+
+**`autolab init` 就是干这件事的**（见上面「B. 新起一个工程」）—— 它会实例化
+全部 6 份模板，其中每一份都**必须先改再用**。手工接入的清单也在那一节。
+
+最容易被照抄出错的还是这两份：
 
 ```bash
+# ⚠️ 仅在手工接入时使用；模板要先实例化，不能原样拷
 cp adapters/stm32-keil-ac5/project.cfg.example  <新工程>/tools/project.cfg
 cp skeleton/gitignore.template                  <新工程>/.gitignore
 ```
 
-两份模板都是**必须先改再用**的：
-
 - `project.cfg` 里照抄参考值（工程名 / 编译动作阈值 / 内存预算 / 必需符号 / 串口）
-  会**直接判错** —— 那是 SDIO_test 的值，不是你的
+  会**直接判错** —— 那是 SDIO_test 的值，不是你的。
+  `autolab init` 会把能实测的项（工程名 / 输出路径 / 内存预算 / 波特率）按本工程填好，
+  实测不出的项（`min_compile_lines`、串口 `port` 等）**留空并进 WARN 列表**，不猜
 - `.gitignore` 里忘了替换 `<PROJECT_NAME>`，规则就匹配不到任何东西，
   **Keil 的输出目录会进版本库**
 

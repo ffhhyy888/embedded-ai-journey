@@ -10,17 +10,17 @@
 
 ## 一、规范在哪（平台仓库，单一来源）
 
-平台仓库默认克隆在 `~/embedded-ai-journey/`（Windows: `C:\Users\HP\embedded-ai-journey\`；
-若路径不同，以本机实际为准）。
+平台仓库（Autolab）在本机的实际位置由**初始化时的运行参数 / 环境 / 运行时发现**确定，
+本文件不写死任何一台机器的绝对路径 —— 换电脑后重跑一次初始化（或改用 `--platform`）即可。
 
 | 主题 | 文件 |
 |---|---|
-| 变更范围 / 规模红线 | `~/embedded-ai-journey/docs/engineering/CHANGE_POLICY.md` |
-| Git 安全 / 回滚 / 禁止清单 | `~/embedded-ai-journey/docs/engineering/GIT_SAFETY.md` |
-| 嵌入式 C 规范 | `~/embedded-ai-journey/docs/engineering/EMBEDDED_C_STANDARD.md` |
-| Python 自动化规范 | `~/embedded-ai-journey/docs/engineering/PYTHON_AUTOMATION_STANDARD.md` |
-| 测试门禁与放行 | `~/embedded-ai-journey/docs/engineering/TEST_AND_RELEASE_POLICY.md` |
-| 本芯片家族的坑 | `~/embedded-ai-journey/adapters/<芯片家族>/PITFALLS.md` |
+| 变更范围 / 规模红线 | `<平台仓库>/docs/engineering/CHANGE_POLICY.md` |
+| Git 安全 / 回滚 / 禁止清单 | `<平台仓库>/docs/engineering/GIT_SAFETY.md` |
+| 嵌入式 C 规范 | `<平台仓库>/docs/engineering/EMBEDDED_C_STANDARD.md` |
+| Python 自动化规范 | `<平台仓库>/docs/engineering/PYTHON_AUTOMATION_STANDARD.md` |
+| 测试门禁与放行 | `<平台仓库>/docs/engineering/TEST_AND_RELEASE_POLICY.md` |
+| 本芯片家族的坑 | `<平台仓库>/adapters/<芯片家族>/PITFALLS.md` |
 
 **开工前先读**：`CHANGE_POLICY` + `GIT_SAFETY` + 对应家族的 `PITFALLS`。
 

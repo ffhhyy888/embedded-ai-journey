@@ -237,4 +237,4 @@ git diff --cached                                       # 提交前复核将要�
 |---|---|
 | [CLAUDE.md](CLAUDE.md) | 本工程的坑、硬约束速查、当前状态 —— **干活前必读** |
 | [docs/HARDENING.md](docs/HARDENING.md) | 各层验收条件与当前 PASS / FAIL / SKIP / NOT RUN |
-| 平台仓库（`~/embedded-ai-journey/`） | 通用骨架、芯片适配器、治理规范（单一来源） |
+| 平台仓库（`${PLATFORM_ROOT}`） | 通用骨架、芯片适配器、治理规范（单一来源） |
